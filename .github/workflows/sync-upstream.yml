@@ -68,11 +68,10 @@ jobs:
       - name: 4. Install OpenAI Package
         run: pip install openai
 
-      - name: 5. Translate Chinese Strings via AI API
+      - name: 5. Translate Chinese Strings via Google Gemini API
         env:
-          AI_API_KEY: ${{ secrets.AI_API_KEY }}
-          AI_BASE_URL: "https://openrouter.ai/api/v1"
-          AI_MODEL: "google/gemini-2.0-flash-exp:free"
+          # GitHub Secrets မှ Gemini API Key ကို ယူခြင်း
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           python3 - << 'EOF'
           import os
@@ -81,11 +80,13 @@ jobs:
           import json
           from openai import OpenAI
 
+          # Google Gemini ၏ OpenAI-compatible Endpoint ကို အသုံးပြုခြင်း
           client = OpenAI(
-              api_key=os.environ.get("AI_API_KEY"),
-              base_url=os.environ.get("AI_BASE_URL")
+              api_key=os.environ.get("GEMINI_API_KEY"),
+              base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
           )
-          model_name = os.environ.get("AI_MODEL")
+          # အခမဲ့ဖြစ်ပြီး အလွန်မြန်ဆန်သော Gemini 1.5 Flash မော်ဒယ်ကို သုံးမည်
+          model_name = "gemini-1.5-flash"
 
           zh_char_re = re.compile(r'[\u4e00-\u9fff]')
           go_string_re = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*[\u4e00-\u9fff]+[^"\\]*(?:\\.[^"\\]*)*)"')
@@ -126,7 +127,7 @@ jobs:
           print(f"Found {len(strings_list)} new unique strings for AI translation.")
 
           if strings_list:
-              print("Phase 2: Translating in batches using AI...")
+              print("Phase 2: Translating in batches using Gemini API...")
               for chunk in chunk_list(strings_list, 20):
                   system_prompt = "You are a cybersecurity software localization expert. Translate the following JSON array of Chinese strings into English. Keep variables like %s, %d, and formatting intact. Respond ONLY with a valid JSON array of strings in the exact same order. Do not include markdown formatting or explanations."
                   user_prompt = json.dumps(chunk, ensure_ascii=False)
@@ -161,36 +162,39 @@ jobs:
                               raise ValueError("Array length mismatch")
                               
                       except Exception as e:
-                          print(f"AI Translation error (attempt {attempt+1}): {e}")
+                          print(f"Gemini API Translation error (attempt {attempt+1}): {e}")
                           time.sleep(5)
                   
-                  time.sleep(1.5)
+                  # Gemini API သည် 1 မိနစ်လျှင် Request 15 ခုသာ အခမဲ့ပေးသဖြင့် 4 စက္ကန့်စီ နားပေးမည်
+                  time.sleep(4)
 
           print("Phase 3: Replacing strings in source files...")
           
-          for filepath in go_files:
+          def process_file(filepath):
               with open(filepath, "r", encoding="utf-8") as file:
                   content = file.read()
-              
               if not zh_char_re.search(content):
-                  continue
+                  return
               
-              # nonlocal အသုံးမပြုတော့ဘဲ ရိုးရှင်းသော Function ဖြင့် အစားထိုးခြင်း
+              changed = False
               def replacer(match):
+                  nonlocal changed
                   original = match.group(1)
                   translated = cache.get(original, original)
                   if translated != original and not zh_char_re.search(translated):
+                      changed = True
                       translated = translated.replace('"', '\\"')
                       return f'"{translated}"'
                   return match.group(0)
 
               new_content = go_string_re.sub(replacer, content)
-              
-              # မူလစာသားနှင့် မတူတော့မှသာ Save မည်
-              if new_content != content:
+              if changed:
                   with open(filepath, "w", encoding="utf-8") as file:
                       file.write(new_content)
                   print(f"Translated: {filepath}")
+
+          for filepath in go_files:
+              process_file(filepath)
 
           print("Translation complete.")
           EOF
