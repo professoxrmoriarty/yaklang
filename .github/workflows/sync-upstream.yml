@@ -68,10 +68,13 @@ jobs:
       - name: 4. Install OpenAI Package
         run: pip install openai
 
-      - name: 5. Translate Chinese Strings via Google Gemini API
+      - name: 5. Translate Chinese Strings via OpenRouter (Llama 3.1)
         env:
-          # GitHub Secrets မှ Gemini API Key ကို ယူခြင်း
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # GitHub Secrets မှ OpenRouter API Key ကို ယူခြင်း
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_BASE_URL: "https://openrouter.ai/api/v1"
+          # အမြဲတမ်း အခမဲ့ဖြစ်သော Llama 3.1 မော်ဒယ်ကို အသုံးပြုခြင်း
+          AI_MODEL: "meta-llama/llama-3.1-8b-instruct:free"
         run: |
           python3 - << 'EOF'
           import os
@@ -80,13 +83,11 @@ jobs:
           import json
           from openai import OpenAI
 
-          # Google Gemini ၏ OpenAI-compatible Endpoint ကို အသုံးပြုခြင်း
           client = OpenAI(
-              api_key=os.environ.get("GEMINI_API_KEY"),
-              base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+              api_key=os.environ.get("AI_API_KEY"),
+              base_url=os.environ.get("AI_BASE_URL")
           )
-          # အခမဲ့ဖြစ်ပြီး အလွန်မြန်ဆန်သော Gemini 1.5 Flash မော်ဒယ်ကို သုံးမည်
-          model_name = "gemini-1.5-flash"
+          model_name = os.environ.get("AI_MODEL")
 
           zh_char_re = re.compile(r'[\u4e00-\u9fff]')
           go_string_re = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*[\u4e00-\u9fff]+[^"\\]*(?:\\.[^"\\]*)*)"')
@@ -107,7 +108,7 @@ jobs:
           strings_to_translate = set()
           go_files = []
 
-          print(("Phase 1: Scanning for Chinese strings...")
+          print("Phase 1: Scanning for Chinese strings...")
           total_strings = 0
           for root, _, files in os.walk("."):
               if "vendor" in root or ".git" in root or "node_modules" in root:
@@ -121,6 +122,7 @@ jobs:
                       if zh_char_re.search(content):
                           for match in go_string_re.finditer(content):
                               text = match.group(1)
+                              # စာလုံးရေ ၃၀၀ အောက်ကိုသာ ရွေးမည်
                               if len(text) <= 300:
                                   total_strings += 1
                                   # Cache ထဲတွင် မရှိသေးသော စာသားအသစ်များကိုသာ ရွေးထုတ်မည်
@@ -135,7 +137,7 @@ jobs:
           print(f"New strings for AI translation: {len(strings_list)}")
 
           if strings_list:
-              print("Phase 2: Translating in batches using Gemini API...")
+              print("Phase 2: Translating in batches using OpenRouter (Llama 3.1)...")
               for chunk in chunk_list(strings_list, 20):
                   system_prompt = "You are a cybersecurity software localization expert. Translate the following JSON array of Chinese strings into English. Keep variables like %s, %d, and formatting intact. Respond ONLY with a valid JSON array of strings in the exact same order. Do not include markdown formatting or explanations."
                   user_prompt = json.dumps(chunk, ensure_ascii=False)
@@ -163,6 +165,7 @@ jobs:
                               for orig, trans in zip(chunk, translated_chunk):
                                   cache[orig] = trans
                               
+                              # Batch ပြီးတိုင်း Cache ကို Save မည်
                               with open(CACHE_FILE, "w", encoding="utf-8") as f:
                                   json.dump(cache, f, ensure_ascii=False, indent=2)
                               break
@@ -170,11 +173,11 @@ jobs:
                               raise ValueError("Array length mismatch")
                               
                       except Exception as e:
-                          print(f"Gemini API Translation error (attempt {attempt+1}): {e}")
+                          print(f"AI Translation error (attempt {attempt+1}): {e}")
                           time.sleep(5)
                   
-                  # Gemini API သည် 1 မိနစ်လျှင် Request 15 ခုသာ အခမဲ့ပေးသဖြင့် 4 စက္ကန့်စီ နားပေးမည်
-                  time.sleep(4)
+                  # API Rate Limit မဖြစ်စေရန် Batch တစ်ခုနှင့် တစ်ခုကြား စောင့်ပေးခြင်း
+                  time.sleep(2)
 
           print("Phase 3: Replacing strings in source files...")
           
@@ -184,19 +187,19 @@ jobs:
               if not zh_char_re.search(content):
                   return
               
-              changed = False
+              # nonlocal ပြဿနာမရှိစေရန် မူလ content နှင့် ပြင်ပြီး content ကို တိုက်စစ်မည့်နည်း
               def replacer(match):
-                  nonlocal changed
                   original = match.group(1)
                   translated = cache.get(original, original)
                   if translated != original and not zh_char_re.search(translated):
-                      changed = True
                       translated = translated.replace('"', '\\"')
                       return f'"{translated}"'
                   return match.group(0)
 
               new_content = go_string_re.sub(replacer, content)
-              if changed:
+              
+              # စာသားများ ပြောင်းလဲသွားမှသာ ဖိုင်ကို Save လုပ်မည်
+              if new_content != content:
                   with open(filepath, "w", encoding="utf-8") as file:
                       file.write(new_content)
                   print(f"Translated: {filepath}")
