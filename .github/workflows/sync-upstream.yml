@@ -1,4 +1,4 @@
-name: Yaklang Engine Sync, Auto-Translate & Release (English)
+name: Yaklang Engine Sync, Auto-Translate (AI) & Release
 
 on:
   schedule:
@@ -37,22 +37,17 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           mkdir -p /tmp/backup/workflows
           cp -r .github/workflows/* /tmp/backup/workflows/ 2>/dev/null || true
-          if [ -f ".i18n_go_cache.json" ]; then
-            cp .i18n_go_cache.json /tmp/backup/.i18n_go_cache.json
-          fi
+          if [ -f ".i18n_ai_cache.json" ]; then cp .i18n_ai_cache.json /tmp/backup/ || true; fi
 
           git remote add upstream "${{ env.UPSTREAM_REPO }}" 2>/dev/null || git remote set-url upstream "${{ env.UPSTREAM_REPO }}"
           git fetch --no-tags --depth=1 upstream "${{ env.UPSTREAM_BRANCH }}:refs/remotes/upstream/${{ env.UPSTREAM_BRANCH }}"
           git fetch --no-tags --depth=1 origin "${{ env.TARGET_BRANCH }}:refs/remotes/origin/${{ env.TARGET_BRANCH }}" 2>/dev/null || true
 
           if git show-ref --verify --quiet "refs/remotes/origin/${{ env.TARGET_BRANCH }}"; then
-            git show "origin/${{ env.TARGET_BRANCH }}:.i18n_go_cache.json" > /tmp/backup/.i18n_go_cache_prev 2>/dev/null || true
-            if [ -s "/tmp/backup/.i18n_go_cache_prev" ]; then
-              cp /tmp/backup/.i18n_go_cache_prev /tmp/backup/.i18n_go_cache.json
-            fi
+            git show "origin/${{ env.TARGET_BRANCH }}:.i18n_ai_cache.json" > /tmp/backup/.i18n_ai_cache_prev 2>/dev/null || true
+            if [ -s "/tmp/backup/.i18n_ai_cache_prev" ]; then cp /tmp/backup/.i18n_ai_cache_prev /tmp/backup/.i18n_ai_cache.json; fi
             git checkout -B "${{ env.TARGET_BRANCH }}" "origin/${{ env.TARGET_BRANCH }}"
             git rm -rf --quiet . || true
             git checkout "refs/remotes/upstream/${{ env.UPSTREAM_BRANCH }}" -- .
@@ -63,33 +58,42 @@ jobs:
           rm -rf .github/workflows/*
           mkdir -p .github/workflows
           cp -r /tmp/backup/workflows/* .github/workflows/ 2>/dev/null || true
-          if [ -f "/tmp/backup/.i18n_go_cache.json" ]; then
-            cp /tmp/backup/.i18n_go_cache.json .i18n_go_cache.json
-          fi
+          if [ -f "/tmp/backup/.i18n_ai_cache.json" ]; then cp /tmp/backup/.i18n_ai_cache.json .i18n_ai_cache.json; fi
 
-      - name: 3. Setup Python for Go Source Translation
+      - name: 3. Setup Python for AI Translation
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 4. Install Translation Dependencies
-        run: |
-          python3 -m pip install --upgrade pip deep-translator
+      - name: 4. Install OpenAI Package
+        run: pip install openai
 
-      - name: 5. Safely Translate Chinese Strings in .go Files
+      - name: 5. Translate Chinese Strings via AI API
+        env:
+          # GitHub Secrets မှ API Key ကို ဆွဲယူခြင်း
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          # OpenRouter ၏ အခမဲ့ (Free) URL
+          AI_BASE_URL: "https://openrouter.ai/api/v1"
+          # Qwen 2.5 7B (Cybersecurity အတွက် အခမဲ့နှင့် မြန်ဆန်သောမော်ဒယ်)
+          AI_MODEL: "qwen/qwen-2.5-7b-instruct:free"
         run: |
           python3 - << 'EOF'
           import os
           import re
           import time
           import json
-          from deep_translator import GoogleTranslator
+          from openai import OpenAI
 
-          translator = GoogleTranslator(source='zh-CN', target='en')
+          client = OpenAI(
+              api_key=os.environ.get("AI_API_KEY"),
+              base_url=os.environ.get("AI_BASE_URL")
+          )
+          model_name = os.environ.get("AI_MODEL")
+
           zh_char_re = re.compile(r'[\u4e00-\u9fff]')
           go_string_re = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*[\u4e00-\u9fff]+[^"\\]*(?:\\.[^"\\]*)*)"')
 
-          CACHE_FILE = ".i18n_go_cache.json"
+          CACHE_FILE = ".i18n_ai_cache.json"
           cache = {}
           if os.path.exists(CACHE_FILE):
               try:
@@ -99,11 +103,9 @@ jobs:
                   cache = {}
 
           def chunk_list(lst, n):
-              """Yield successive n-sized chunks from lst."""
               for i in range(0, len(lst), n):
                   yield lst[i:i + n]
 
-          # ပထမအဆင့်: ဘာသာပြန်ရန်လိုအပ်သော စာသားများအားလုံးကို ရှာဖွေစုဆောင်းခြင်း
           strings_to_translate = set()
           go_files = []
 
@@ -124,46 +126,54 @@ jobs:
                                   strings_to_translate.add(text)
 
           strings_list = list(strings_to_translate)
-          print(f"Found {len(strings_list)} new unique strings to translate.")
+          print(f"Found {len(strings_list)} new unique strings for AI translation.")
 
-          # ဒုတိယအဆင့်: Batch လိုက်စု၍ ဘာသာပြန်ခြင်း (Rate Limit သက်သာစေရန်)
           if strings_list:
-              print("Phase 2: Translating in batches...")
-              # တစ်ကြိမ်လျှင် စာကြောင်း ၂၀ စီ စု၍ ဘာသာပြန်မည်
+              print("Phase 2: Translating in batches using AI...")
               for chunk in chunk_list(strings_list, 20):
-                  try:
-                      # Batch Translation
-                      translated_chunk = translator.translate_batch(chunk)
-                      for orig, trans in zip(chunk, translated_chunk):
-                          if trans:
-                              cache[orig] = trans
-                          else:
-                              cache[orig] = orig # ဘာသာမပြန်နိုင်ပါက မူလစာသားထားမည်
-                      
-                      # Save cache progressively
-                      with open(CACHE_FILE, "w", encoding="utf-8") as f:
-                          json.dump(cache, f, ensure_ascii=False, indent=2)
+                  system_prompt = "You are a cybersecurity software localization expert. Translate the following JSON array of Chinese strings into English. Keep variables like %s, %d, and formatting intact. Respond ONLY with a valid JSON array of strings in the exact same order. Do not include markdown formatting or explanations."
+                  user_prompt = json.dumps(chunk, ensure_ascii=False)
+                  
+                  for attempt in range(3):
+                      try:
+                          response = client.chat.completions.create(
+                              model=model_name,
+                              messages=[
+                                  {"role": "system", "content": system_prompt},
+                                  {"role": "user", "content": user_prompt}
+                              ],
+                              temperature=0.1
+                          )
                           
-                      # API ကို ၃ စက္ကန့်စီ နားပေးမည်
-                      time.sleep(3)
-                  except Exception as e:
-                      print(f"Batch translation error: {e}. Waiting 10 seconds before retrying...")
-                      time.sleep(10)
-                      # Error တက်ပါက တစ်ကြောင်းချင်းစီ သွားမည့် Fallback
-                      for orig in chunk:
-                          try:
-                              cache[orig] = translator.translate(orig)
-                              time.sleep(1.5)
-                          except:
-                              cache[orig] = orig
-                              time.sleep(2)
+                          result_text = response.choices[0].message.content.strip()
+                          # Clean Markdown blocks if AI includes them
+                          if result_text.startswith("```json"):
+                              result_text = result_text[7:-3].strip()
+                          elif result_text.startswith("```"):
+                              result_text = result_text[3:-3].strip()
+                              
+                          translated_chunk = json.loads(result_text)
+                          
+                          if len(translated_chunk) == len(chunk):
+                              for orig, trans in zip(chunk, translated_chunk):
+                                  cache[orig] = trans
+                              
+                              with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                                  json.dump(cache, f, ensure_ascii=False, indent=2)
+                              break # Success, break retry loop
+                          else:
+                              raise ValueError("Array length mismatch")
+                              
+                      except Exception as e:
+                          print(f"AI Translation error (attempt {attempt+1}): {e}")
+                          time.sleep(5)
+                  
+                  time.sleep(1) # Small delay between batches
 
-          # တတိယအဆင့်: ဘာသာပြန်ပြီးသား စာသားများကို ဖိုင်များထဲသို့ ပြန်လည် အစားထိုးခြင်း
           print("Phase 3: Replacing strings in source files...")
           for filepath in go_files:
               with open(filepath, "r", encoding="utf-8") as file:
                   content = file.read()
-              
               if not zh_char_re.search(content):
                   continue
               
@@ -171,9 +181,7 @@ jobs:
               def replacer(match):
                   nonlocal changed
                   original = match.group(1)
-                  # Cache ထဲတွင်မရှိပါက (ဥပမာ စာလုံးရေ ၃၀၀ ကျော်များ) မူလစာသားသာ ထားမည်
                   translated = cache.get(original, original)
-                  
                   if translated != original and not zh_char_re.search(translated):
                       changed = True
                       translated = translated.replace('"', '\\"')
@@ -181,7 +189,6 @@ jobs:
                   return match.group(0)
 
               new_content = go_string_re.sub(replacer, content)
-              
               if changed:
                   with open(filepath, "w", encoding="utf-8") as file:
                       file.write(new_content)
@@ -192,10 +199,10 @@ jobs:
 
       - name: 6. Commit and Push English Engine Source
         run: |
-          git add -f .i18n_go_cache.json .github/ 2>/dev/null || true
+          git add -f .i18n_ai_cache.json .github/ 2>/dev/null || true
           git add -A
           if ! git diff --cached --quiet; then
-            git commit -m "chore(i18n): sync engine upstream and translate .go sources"
+            git commit -m "chore(i18n): sync engine upstream and translate .go sources via AI"
           fi
           git push -u origin "${{ env.TARGET_BRANCH }}" --force
 
@@ -207,9 +214,6 @@ jobs:
           git push origin "refs/tags/${EN_TAG}" --force
           echo "release_tag=${EN_TAG}" >> "$GITHUB_OUTPUT"
 
-  # ---------------------------------------------------------------------------
-  # အဆင့် (၂) - Go ဖြင့် အင်ဂျင်ကို OS မျိုးစုံအတွက် တည်ဆောက်ခြင်း
-  # ---------------------------------------------------------------------------
   build-engine:
     name: Build Yaklang Engine (${{ matrix.goos }}/${{ matrix.goarch }})
     needs: sync-and-translate
@@ -257,7 +261,6 @@ jobs:
           CGO_ENABLED: 0
         run: |
           go mod tidy
-          # Yaklang ရဲ့ အဓိက Entrypoint ဖြစ်တဲ့ common/yak/cmd/yak.go ကို Build ခြင်း
           go build -trimpath -ldflags="-s -w" -o build/${{ matrix.output }} ./common/yak/cmd/yak.go
 
       - name: 4. Upload Engine Artifact
@@ -266,9 +269,6 @@ jobs:
           name: engine-${{ matrix.goos }}-${{ matrix.goarch }}
           path: build/${{ matrix.output }}
 
-  # ---------------------------------------------------------------------------
-  # အဆင့် (၃) - အင်္ဂလိပ်ဗားရှင်း အင်ဂျင်ကို Release အဖြစ် ထုတ်ပြန်ခြင်း
-  # ---------------------------------------------------------------------------
   publish-engine-release:
     name: Publish English Engine Release
     needs: [sync-and-translate, build-engine]
@@ -289,7 +289,7 @@ jobs:
           overwrite: true
           body: |
             ### Yaklang Core Engine (English Edition)
-            * Translated `.go` source files into English.
+            * Translated `.go` source files into English using **OpenRouter AI (Qwen-2.5)**.
             * Pre-compiled standalone binaries for Yakit Integration.
           draft: false
           prerelease: false
