@@ -29,8 +29,17 @@ for root, _, files in os.walk("."):
     for f in files:
         if f.endswith(".go") and not f.endswith("_test.go"):
             filepath = os.path.join(root, f)
-            with open(filepath, "r", encoding="utf-8") as file:
-                content = file.read()
+            
+            # Windows Defender ပိတ်ထားသော ဖိုင်များအတွက် Error Handling
+            try:
+                with open(filepath, "r", encoding="utf-8") as file:
+                    content = file.read()
+            except OSError as e:
+                print(f"⚠️ Skipping file (AV Blocked or Access Denied): {filepath}")
+                continue
+            except Exception as e:
+                continue
+
             if zh_char_re.search(content):
                 for match in go_string_re.finditer(content):
                     text = match.group(1)
@@ -41,19 +50,18 @@ strings_list = list(strings_to_translate)
 print(f"Found {len(strings_list)} new strings to translate locally.")
 
 if strings_list:
+    print("Starting translation...")
     for chunk in chunk_list(strings_list, 15):
         try:
-            # Batch ဖြင့် ဘာသာပြန်ခြင်း
             translations = translator.translate_batch(chunk)
             for orig, trans in zip(chunk, translations):
                 cache[orig] = trans if trans else orig
             
-            # ချက်ချင်း Save မည် (ရပ်သွားပါက ပြန်ဆက်နိုင်ရန်)
             with open(CACHE_FILE, "w", encoding="utf-8") as f:
                 json.dump(cache, f, ensure_ascii=False, indent=2)
             
-            print(f"Translated a batch of 15 strings... (Waiting 2 seconds)")
-            time.sleep(2) # Local တွင် Rate limit မဖြစ်စေရန်
+            print(f"Translated a batch of 15 strings... (Waiting 1.5 seconds)")
+            time.sleep(1.5) 
         except Exception as e:
             print(f"Error: {e}. Waiting 5 seconds before retrying...")
             time.sleep(5)
