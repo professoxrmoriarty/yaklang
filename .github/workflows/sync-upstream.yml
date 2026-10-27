@@ -100,15 +100,28 @@ jobs:
                   cache = {}
 
           def translate_text(text):
-              if text in cache: return cache[text]
-              try:
-                  res = translator.translate(text)
-                  time.sleep(0.4)
-                  cache[text] = res
-                  return res
-              except Exception as e:
-                  print(f"Error translating '{text}': {e}")
+              # Test Case များနှင့် စာပိုဒ်ရှည်ကြီးများကို ဘာသာမပြန်ဘဲ ကျော်ရန် (Rate Limit ကာကွယ်ရန်)
+              if len(text) > 300:
                   return text
+              
+              if text in cache: 
+                  return cache[text]
+              
+              # Retry mechanism (၃ ကြိမ်အထိ ပြန်ကြိုးစားမည်)
+              for attempt in range(3):
+                  try:
+                      res = translator.translate(text)
+                      # Google API ကို အနားပေးရန် Delay ထည့်ခြင်း (Request များလွန်းခြင်းမှ ကာကွယ်ရန်)
+                      time.sleep(1.5)
+                      cache[text] = res
+                      return res
+                  except Exception as e:
+                      print(f"Attempt {attempt+1} failed for '{text[:30]}...': {e}")
+                      # Error တက်ပါက အချိန်ပိုစောင့်ပြီး ပြန်ကြိုးစားမည်
+                      time.sleep(3.0)
+              
+              # ၃ ကြိမ်လုံး ကျရှုံးပါက မူလတရုတ်စာသားကိုသာ ပြန်ထားခဲ့မည် (Script မရပ်သွားစေရန်)
+              return text
 
           def process_file(filepath):
               with open(filepath, "r", encoding="utf-8") as file:
@@ -124,6 +137,7 @@ jobs:
                   translated = translate_text(original)
                   if translated != original and not zh_char_re.search(translated):
                       changed = True
+                      # Escape string
                       translated = translated.replace('"', '\\"')
                       return f'"{translated}"'
                   return match.group(0)
@@ -136,11 +150,14 @@ jobs:
                   print(f"Translated strings in: {filepath}")
 
           for root, _, files in os.walk("."):
-              # Vendor နှင့် Git များကို ကျော်သွားရန်
+              # Vendor နှင့် Git များကို ကျော်သွားရန် (Test ဖိုဒါများကိုပါ ချန်လှပ်လိုပါက "test" in root ကို ထည့်နိုင်ပါသည်)
               if "vendor" in root or ".git" in root or "node_modules" in root:
                   continue
               for f in files:
                   if f.endswith(".go"):
+                      # Test ဖိုင်များ (_test.go) ကို ဘာသာမပြန်ဘဲ ကျော်သွားရန် (Rate Limit သက်သာစေရန်)
+                      if f.endswith("_test.go"):
+                          continue
                       process_file(os.path.join(root, f))
 
           with open(CACHE_FILE, "w", encoding="utf-8") as f:
