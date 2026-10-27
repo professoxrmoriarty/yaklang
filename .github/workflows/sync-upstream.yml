@@ -87,7 +87,6 @@ jobs:
 
           translator = GoogleTranslator(source='zh-CN', target='en')
           zh_char_re = re.compile(r'[\u4e00-\u9fff]')
-          # Double quotes အတွင်းရှိ တရုတ်စာများကို ဖမ်းယူမည့် Regex
           go_string_re = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*[\u4e00-\u9fff]+[^"\\]*(?:\\.[^"\\]*)*)"')
 
           CACHE_FILE = ".i18n_go_cache.json"
@@ -99,45 +98,84 @@ jobs:
               except:
                   cache = {}
 
-          def translate_text(text):
-              # Test Case များနှင့် စာပိုဒ်ရှည်ကြီးများကို ဘာသာမပြန်ဘဲ ကျော်ရန် (Rate Limit ကာကွယ်ရန်)
-              if len(text) > 300:
-                  return text
-              
-              if text in cache: 
-                  return cache[text]
-              
-              # Retry mechanism (၃ ကြိမ်အထိ ပြန်ကြိုးစားမည်)
-              for attempt in range(3):
-                  try:
-                      res = translator.translate(text)
-                      # Google API ကို အနားပေးရန် Delay ထည့်ခြင်း (Request များလွန်းခြင်းမှ ကာကွယ်ရန်)
-                      time.sleep(1.5)
-                      cache[text] = res
-                      return res
-                  except Exception as e:
-                      print(f"Attempt {attempt+1} failed for '{text[:30]}...': {e}")
-                      # Error တက်ပါက အချိန်ပိုစောင့်ပြီး ပြန်ကြိုးစားမည်
-                      time.sleep(3.0)
-              
-              # ၃ ကြိမ်လုံး ကျရှုံးပါက မူလတရုတ်စာသားကိုသာ ပြန်ထားခဲ့မည် (Script မရပ်သွားစေရန်)
-              return text
+          def chunk_list(lst, n):
+              """Yield successive n-sized chunks from lst."""
+              for i in range(0, len(lst), n):
+                  yield lst[i:i + n]
 
-          def process_file(filepath):
+          # ပထမအဆင့်: ဘာသာပြန်ရန်လိုအပ်သော စာသားများအားလုံးကို ရှာဖွေစုဆောင်းခြင်း
+          strings_to_translate = set()
+          go_files = []
+
+          print("Phase 1: Scanning for Chinese strings...")
+          for root, _, files in os.walk("."):
+              if "vendor" in root or ".git" in root or "node_modules" in root:
+                  continue
+              for f in files:
+                  if f.endswith(".go") and not f.endswith("_test.go"):
+                      filepath = os.path.join(root, f)
+                      go_files.append(filepath)
+                      with open(filepath, "r", encoding="utf-8") as file:
+                          content = file.read()
+                      if zh_char_re.search(content):
+                          for match in go_string_re.finditer(content):
+                              text = match.group(1)
+                              if len(text) <= 300 and text not in cache:
+                                  strings_to_translate.add(text)
+
+          strings_list = list(strings_to_translate)
+          print(f"Found {len(strings_list)} new unique strings to translate.")
+
+          # ဒုတိယအဆင့်: Batch လိုက်စု၍ ဘာသာပြန်ခြင်း (Rate Limit သက်သာစေရန်)
+          if strings_list:
+              print("Phase 2: Translating in batches...")
+              # တစ်ကြိမ်လျှင် စာကြောင်း ၂၀ စီ စု၍ ဘာသာပြန်မည်
+              for chunk in chunk_list(strings_list, 20):
+                  try:
+                      # Batch Translation
+                      translated_chunk = translator.translate_batch(chunk)
+                      for orig, trans in zip(chunk, translated_chunk):
+                          if trans:
+                              cache[orig] = trans
+                          else:
+                              cache[orig] = orig # ဘာသာမပြန်နိုင်ပါက မူလစာသားထားမည်
+                      
+                      # Save cache progressively
+                      with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                          json.dump(cache, f, ensure_ascii=False, indent=2)
+                          
+                      # API ကို ၃ စက္ကန့်စီ နားပေးမည်
+                      time.sleep(3)
+                  except Exception as e:
+                      print(f"Batch translation error: {e}. Waiting 10 seconds before retrying...")
+                      time.sleep(10)
+                      # Error တက်ပါက တစ်ကြောင်းချင်းစီ သွားမည့် Fallback
+                      for orig in chunk:
+                          try:
+                              cache[orig] = translator.translate(orig)
+                              time.sleep(1.5)
+                          except:
+                              cache[orig] = orig
+                              time.sleep(2)
+
+          # တတိယအဆင့်: ဘာသာပြန်ပြီးသား စာသားများကို ဖိုင်များထဲသို့ ပြန်လည် အစားထိုးခြင်း
+          print("Phase 3: Replacing strings in source files...")
+          for filepath in go_files:
               with open(filepath, "r", encoding="utf-8") as file:
                   content = file.read()
               
               if not zh_char_re.search(content):
-                  return
+                  continue
               
               changed = False
               def replacer(match):
                   nonlocal changed
                   original = match.group(1)
-                  translated = translate_text(original)
+                  # Cache ထဲတွင်မရှိပါက (ဥပမာ စာလုံးရေ ၃၀၀ ကျော်များ) မူလစာသားသာ ထားမည်
+                  translated = cache.get(original, original)
+                  
                   if translated != original and not zh_char_re.search(translated):
                       changed = True
-                      # Escape string
                       translated = translated.replace('"', '\\"')
                       return f'"{translated}"'
                   return match.group(0)
@@ -147,21 +185,9 @@ jobs:
               if changed:
                   with open(filepath, "w", encoding="utf-8") as file:
                       file.write(new_content)
-                  print(f"Translated strings in: {filepath}")
+                  print(f"Translated: {filepath}")
 
-          for root, _, files in os.walk("."):
-              # Vendor နှင့် Git များကို ကျော်သွားရန် (Test ဖိုဒါများကိုပါ ချန်လှပ်လိုပါက "test" in root ကို ထည့်နိုင်ပါသည်)
-              if "vendor" in root or ".git" in root or "node_modules" in root:
-                  continue
-              for f in files:
-                  if f.endswith(".go"):
-                      # Test ဖိုင်များ (_test.go) ကို ဘာသာမပြန်ဘဲ ကျော်သွားရန် (Rate Limit သက်သာစေရန်)
-                      if f.endswith("_test.go"):
-                          continue
-                      process_file(os.path.join(root, f))
-
-          with open(CACHE_FILE, "w", encoding="utf-8") as f:
-              json.dump(cache, f, ensure_ascii=False, indent=2)
+          print("Translation complete.")
           EOF
 
       - name: 6. Commit and Push English Engine Source
