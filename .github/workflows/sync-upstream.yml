@@ -68,13 +68,10 @@ jobs:
       - name: 4. Install OpenAI Package
         run: pip install openai
 
-      - name: 5. Translate Chinese Strings via OpenRouter (Llama 3.1)
+      - name: 5. Translate Chinese Strings via OpenRouter (Auto-Fallback)
         env:
-          # GitHub Secrets မှ OpenRouter API Key ကို ယူခြင်း
           AI_API_KEY: ${{ secrets.AI_API_KEY }}
           AI_BASE_URL: "https://openrouter.ai/api/v1"
-          # အမြဲတမ်း အခမဲ့ဖြစ်သော Llama 3.1 မော်ဒယ်ကို အသုံးပြုခြင်း
-          AI_MODEL: "meta-llama/llama-3.1-8b-instruct:free"
         run: |
           python3 - << 'EOF'
           import os
@@ -87,7 +84,15 @@ jobs:
               api_key=os.environ.get("AI_API_KEY"),
               base_url=os.environ.get("AI_BASE_URL")
           )
-          model_name = os.environ.get("AI_MODEL")
+
+          # ၁၀၀% အလုပ်ဖြစ်စေရန် Free Model (၅) ခု ထည့်ထားသည်။ တစ်ခုပျက်ပါက နောက်တစ်ခုသို့ အလိုအလျောက် ပြောင်းမည်။
+          FREE_MODELS = [
+              "google/gemini-2.0-flash-lite-preview-02-05:free",
+              "mistralai/mistral-nemo:free",
+              "meta-llama/llama-3.2-3b-instruct:free",
+              "qwen/qwen-2.5-coder-32b-instruct:free",
+              "microsoft/phi-3-mini-128k-instruct:free"
+          ]
 
           zh_char_re = re.compile(r'[\u4e00-\u9fff]')
           go_string_re = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*[\u4e00-\u9fff]+[^"\\]*(?:\\.[^"\\]*)*)"')
@@ -122,62 +127,67 @@ jobs:
                       if zh_char_re.search(content):
                           for match in go_string_re.finditer(content):
                               text = match.group(1)
-                              # စာလုံးရေ ၃၀၀ အောက်ကိုသာ ရွေးမည်
                               if len(text) <= 300:
                                   total_strings += 1
-                                  # Cache ထဲတွင် မရှိသေးသော စာသားအသစ်များကိုသာ ရွေးထုတ်မည်
                                   if text not in cache:
                                       strings_to_translate.add(text)
 
           strings_list = list(strings_to_translate)
           already_translated = total_strings - len(strings_list)
           
-          print(f"Total Chinese strings detected: {total_strings}")
-          print(f"Skipped (Already translated in cache): {already_translated}")
-          print(f"New strings for AI translation: {len(strings_list)}")
+          print(f"Total strings: {total_strings}, Skipped: {already_translated}, New to translate: {len(strings_list)}")
 
           if strings_list:
-              print("Phase 2: Translating in batches using OpenRouter (Llama 3.1)...")
+              print("Phase 2: Translating in batches using Auto-Fallback...")
               for chunk in chunk_list(strings_list, 20):
                   system_prompt = "You are a cybersecurity software localization expert. Translate the following JSON array of Chinese strings into English. Keep variables like %s, %d, and formatting intact. Respond ONLY with a valid JSON array of strings in the exact same order. Do not include markdown formatting or explanations."
                   user_prompt = json.dumps(chunk, ensure_ascii=False)
                   
-                  for attempt in range(3):
-                      try:
-                          response = client.chat.completions.create(
-                              model=model_name,
-                              messages=[
-                                  {"role": "system", "content": system_prompt},
-                                  {"role": "user", "content": user_prompt}
-                              ],
-                              temperature=0.1
-                          )
-                          
-                          result_text = response.choices[0].message.content.strip()
-                          if result_text.startswith("```json"):
-                              result_text = result_text[7:-3].strip()
-                          elif result_text.startswith("```"):
-                              result_text = result_text[3:-3].strip()
+                  success = False
+                  # မော်ဒယ်တစ်ခုချင်းစီကို အလုပ်လုပ်သည်အထိ လှည့်ပတ်စမ်းသပ်မည်
+                  for model_name in FREE_MODELS:
+                      if success: break
+                      for attempt in range(2):
+                          try:
+                              response = client.chat.completions.create(
+                                  model=model_name,
+                                  messages=[
+                                      {"role": "system", "content": system_prompt},
+                                      {"role": "user", "content": user_prompt}
+                                  ],
+                                  temperature=0.1
+                              )
                               
-                          translated_chunk = json.loads(result_text)
-                          
-                          if len(translated_chunk) == len(chunk):
-                              for orig, trans in zip(chunk, translated_chunk):
-                                  cache[orig] = trans
+                              result_text = response.choices[0].message.content.strip()
+                              if result_text.startswith("```json"):
+                                  result_text = result_text[7:-3].strip()
+                              elif result_text.startswith("```"):
+                                  result_text = result_text[3:-3].strip()
+                                  
+                              translated_chunk = json.loads(result_text)
                               
-                              # Batch ပြီးတိုင်း Cache ကို Save မည်
-                              with open(CACHE_FILE, "w", encoding="utf-8") as f:
-                                  json.dump(cache, f, ensure_ascii=False, indent=2)
-                              break
-                          else:
-                              raise ValueError("Array length mismatch")
-                              
-                      except Exception as e:
-                          print(f"AI Translation error (attempt {attempt+1}): {e}")
-                          time.sleep(5)
+                              if len(translated_chunk) == len(chunk):
+                                  for orig, trans in zip(chunk, translated_chunk):
+                                      cache[orig] = trans
+                                  with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                                      json.dump(cache, f, ensure_ascii=False, indent=2)
+                                  success = True
+                                  break # ဤအသုတ် အောင်မြင်သွားပြီဖြစ်၍ ရပ်မည်
+                              else:
+                                  raise ValueError("Array length mismatch")
+                                  
+                          except Exception as e:
+                              error_msg = str(e)
+                              print(f"[{model_name}] error: {error_msg}")
+                              # 404 သို့မဟုတ် 429 တက်ပါက ချက်ချင်း နောက်မော်ဒယ်တစ်ခုသို့ ကူးပြောင်းမည်
+                              if "404" in error_msg or "429" in error_msg:
+                                  break 
+                              time.sleep(2)
                   
-                  # API Rate Limit မဖြစ်စေရန် Batch တစ်ခုနှင့် တစ်ခုကြား စောင့်ပေးခြင်း
-                  time.sleep(2)
+                  if not success:
+                      print("Warning: All free models failed for this chunk. Skipping to next chunk...")
+                  
+                  time.sleep(1)
 
           print("Phase 3: Replacing strings in source files...")
           
@@ -187,7 +197,6 @@ jobs:
               if not zh_char_re.search(content):
                   return
               
-              # nonlocal ပြဿနာမရှိစေရန် မူလ content နှင့် ပြင်ပြီး content ကို တိုက်စစ်မည့်နည်း
               def replacer(match):
                   original = match.group(1)
                   translated = cache.get(original, original)
@@ -198,7 +207,6 @@ jobs:
 
               new_content = go_string_re.sub(replacer, content)
               
-              # စာသားများ ပြောင်းလဲသွားမှသာ ဖိုင်ကို Save လုပ်မည်
               if new_content != content:
                   with open(filepath, "w", encoding="utf-8") as file:
                       file.write(new_content)
