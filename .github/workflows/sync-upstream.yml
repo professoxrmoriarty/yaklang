@@ -110,36 +110,38 @@ jobs:
                   print(f"Error translating '{text}': {e}")
                   return text
 
+          def process_file(filepath):
+              with open(filepath, "r", encoding="utf-8") as file:
+                  content = file.read()
+              
+              if not zh_char_re.search(content):
+                  return
+              
+              changed = False
+              def replacer(match):
+                  nonlocal changed
+                  original = match.group(1)
+                  translated = translate_text(original)
+                  if translated != original and not zh_char_re.search(translated):
+                      changed = True
+                      translated = translated.replace('"', '\\"')
+                      return f'"{translated}"'
+                  return match.group(0)
+
+              new_content = go_string_re.sub(replacer, content)
+              
+              if changed:
+                  with open(filepath, "w", encoding="utf-8") as file:
+                      file.write(new_content)
+                  print(f"Translated strings in: {filepath}")
+
           for root, _, files in os.walk("."):
               # Vendor နှင့် Git များကို ကျော်သွားရန်
               if "vendor" in root or ".git" in root or "node_modules" in root:
                   continue
               for f in files:
                   if f.endswith(".go"):
-                      filepath = os.path.join(root, f)
-                      with open(filepath, "r", encoding="utf-8") as file:
-                          content = file.read()
-                      
-                      if not zh_char_re.search(content):
-                          continue
-                      
-                      changed = False
-                      def replacer(match):
-                          nonlocal changed
-                          original = match.group(1)
-                          translated = translate_text(original)
-                          if translated != original and not zh_char_re.search(translated):
-                              changed = True
-                              translated = translated.replace('"', '\\"')
-                              return f'"{translated}"'
-                          return match.group(0)
-
-                      new_content = go_string_re.sub(replacer, content)
-                      
-                      if changed:
-                          with open(filepath, "w", encoding="utf-8") as file:
-                              file.write(new_content)
-                          print(f"Translated strings in: {filepath}")
+                      process_file(os.path.join(root, f))
 
           with open(CACHE_FILE, "w", encoding="utf-8") as f:
               json.dump(cache, f, ensure_ascii=False, indent=2)
