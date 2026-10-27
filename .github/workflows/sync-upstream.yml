@@ -107,7 +107,8 @@ jobs:
           strings_to_translate = set()
           go_files = []
 
-          print("Phase 1: Scanning for Chinese strings...")
+          print(("Phase 1: Scanning for Chinese strings...")
+          total_strings = 0
           for root, _, files in os.walk("."):
               if "vendor" in root or ".git" in root or "node_modules" in root:
                   continue
@@ -120,11 +121,18 @@ jobs:
                       if zh_char_re.search(content):
                           for match in go_string_re.finditer(content):
                               text = match.group(1)
-                              if len(text) <= 300 and text not in cache:
-                                  strings_to_translate.add(text)
+                              if len(text) <= 300:
+                                  total_strings += 1
+                                  # Cache ထဲတွင် မရှိသေးသော စာသားအသစ်များကိုသာ ရွေးထုတ်မည်
+                                  if text not in cache:
+                                      strings_to_translate.add(text)
 
           strings_list = list(strings_to_translate)
-          print(f"Found {len(strings_list)} new unique strings for AI translation.")
+          already_translated = total_strings - len(strings_list)
+          
+          print(f"Total Chinese strings detected: {total_strings}")
+          print(f"Skipped (Already translated in cache): {already_translated}")
+          print(f"New strings for AI translation: {len(strings_list)}")
 
           if strings_list:
               print("Phase 2: Translating in batches using Gemini API...")
