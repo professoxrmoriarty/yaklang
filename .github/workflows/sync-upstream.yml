@@ -70,11 +70,8 @@ jobs:
 
       - name: 5. Translate Chinese Strings via AI API
         env:
-          # GitHub Secrets မှ API Key ကို ဆွဲယူခြင်း
           AI_API_KEY: ${{ secrets.AI_API_KEY }}
-          # OpenRouter ၏ အခမဲ့ (Free) URL
           AI_BASE_URL: "https://openrouter.ai/api/v1"
-          # Qwen 2.5 7B (Cybersecurity အတွက် အခမဲ့နှင့် မြန်ဆန်သောမော်ဒယ်)
           AI_MODEL: "qwen/qwen-2.5-7b-instruct:free"
         run: |
           python3 - << 'EOF'
@@ -146,7 +143,6 @@ jobs:
                           )
                           
                           result_text = response.choices[0].message.content.strip()
-                          # Clean Markdown blocks if AI includes them
                           if result_text.startswith("```json"):
                               result_text = result_text[7:-3].strip()
                           elif result_text.startswith("```"):
@@ -160,7 +156,7 @@ jobs:
                               
                               with open(CACHE_FILE, "w", encoding="utf-8") as f:
                                   json.dump(cache, f, ensure_ascii=False, indent=2)
-                              break # Success, break retry loop
+                              break
                           else:
                               raise ValueError("Array length mismatch")
                               
@@ -168,28 +164,30 @@ jobs:
                           print(f"AI Translation error (attempt {attempt+1}): {e}")
                           time.sleep(5)
                   
-                  time.sleep(1) # Small delay between batches
+                  time.sleep(1.5)
 
           print("Phase 3: Replacing strings in source files...")
+          
           for filepath in go_files:
               with open(filepath, "r", encoding="utf-8") as file:
                   content = file.read()
+              
               if not zh_char_re.search(content):
                   continue
               
-              changed = False
+              # nonlocal အသုံးမပြုတော့ဘဲ ရိုးရှင်းသော Function ဖြင့် အစားထိုးခြင်း
               def replacer(match):
-                  nonlocal changed
                   original = match.group(1)
                   translated = cache.get(original, original)
                   if translated != original and not zh_char_re.search(translated):
-                      changed = True
                       translated = translated.replace('"', '\\"')
                       return f'"{translated}"'
                   return match.group(0)
 
               new_content = go_string_re.sub(replacer, content)
-              if changed:
+              
+              # မူလစာသားနှင့် မတူတော့မှသာ Save မည်
+              if new_content != content:
                   with open(filepath, "w", encoding="utf-8") as file:
                       file.write(new_content)
                   print(f"Translated: {filepath}")
