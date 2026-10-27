@@ -1,0 +1,251 @@
+name: Yaklang Engine Sync, Auto-Translate & Release (English)
+
+on:
+  schedule:
+    - cron: '0 */12 * * *'
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: 'Release အသစ် အတင်းထုတ်မည်လား? (true ရွေးပါ)'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  UPSTREAM_REPO: "https://github.com/yaklang/yaklang.git"
+  UPSTREAM_BRANCH: "master"
+  TARGET_BRANCH: "english-edition"
+
+jobs:
+  sync-and-translate:
+    name: Sync Upstream & Translate Go Source
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.check_release.outputs.release_tag }}
+    steps:
+      - name: 1. Checkout Fork Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 2. Configure Git & Sync Upstream
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          mkdir -p /tmp/backup/workflows
+          cp -r .github/workflows/* /tmp/backup/workflows/ 2>/dev/null || true
+          if [ -f ".i18n_go_cache.json" ]; then
+            cp .i18n_go_cache.json /tmp/backup/.i18n_go_cache.json
+          fi
+
+          git remote add upstream "${{ env.UPSTREAM_REPO }}" 2>/dev/null || git remote set-url upstream "${{ env.UPSTREAM_REPO }}"
+          git fetch --no-tags --depth=1 upstream "${{ env.UPSTREAM_BRANCH }}:refs/remotes/upstream/${{ env.UPSTREAM_BRANCH }}"
+          git fetch --no-tags --depth=1 origin "${{ env.TARGET_BRANCH }}:refs/remotes/origin/${{ env.TARGET_BRANCH }}" 2>/dev/null || true
+
+          if git show-ref --verify --quiet "refs/remotes/origin/${{ env.TARGET_BRANCH }}"; then
+            git show "origin/${{ env.TARGET_BRANCH }}:.i18n_go_cache.json" > /tmp/backup/.i18n_go_cache_prev 2>/dev/null || true
+            if [ -s "/tmp/backup/.i18n_go_cache_prev" ]; then
+              cp /tmp/backup/.i18n_go_cache_prev /tmp/backup/.i18n_go_cache.json
+            fi
+            git checkout -B "${{ env.TARGET_BRANCH }}" "origin/${{ env.TARGET_BRANCH }}"
+            git rm -rf --quiet . || true
+            git checkout "refs/remotes/upstream/${{ env.UPSTREAM_BRANCH }}" -- .
+          else
+            git checkout -B "${{ env.TARGET_BRANCH }}" "refs/remotes/upstream/${{ env.UPSTREAM_BRANCH }}"
+          fi
+
+          rm -rf .github/workflows/*
+          mkdir -p .github/workflows
+          cp -r /tmp/backup/workflows/* .github/workflows/ 2>/dev/null || true
+          if [ -f "/tmp/backup/.i18n_go_cache.json" ]; then
+            cp /tmp/backup/.i18n_go_cache.json .i18n_go_cache.json
+          fi
+
+      - name: 3. Setup Python for Go Source Translation
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 4. Install Translation Dependencies
+        run: |
+          python3 -m pip install --upgrade pip deep-translator
+
+      - name: 5. Safely Translate Chinese Strings in .go Files
+        run: |
+          python3 - << 'EOF'
+          import os
+          import re
+          import time
+          import json
+          from deep_translator import GoogleTranslator
+
+          translator = GoogleTranslator(source='zh-CN', target='en')
+          zh_char_re = re.compile(r'[\u4e00-\u9fff]')
+          # Double quotes အတွင်းရှိ တရုတ်စာများကို ဖမ်းယူမည့် Regex
+          go_string_re = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*[\u4e00-\u9fff]+[^"\\]*(?:\\.[^"\\]*)*)"')
+
+          CACHE_FILE = ".i18n_go_cache.json"
+          cache = {}
+          if os.path.exists(CACHE_FILE):
+              try:
+                  with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+                      cache = json.load(f)
+              except:
+                  cache = {}
+
+          def translate_text(text):
+              if text in cache: return cache[text]
+              try:
+                  res = translator.translate(text)
+                  time.sleep(0.4)
+                  cache[text] = res
+                  return res
+              except Exception as e:
+                  print(f"Error translating '{text}': {e}")
+                  return text
+
+          for root, _, files in os.walk("."):
+              # Vendor နှင့် Git များကို ကျော်သွားရန်
+              if "vendor" in root or ".git" in root or "node_modules" in root:
+                  continue
+              for f in files:
+                  if f.endswith(".go"):
+                      filepath = os.path.join(root, f)
+                      with open(filepath, "r", encoding="utf-8") as file:
+                          content = file.read()
+                      
+                      if not zh_char_re.search(content):
+                          continue
+                      
+                      changed = False
+                      def replacer(match):
+                          nonlocal changed
+                          original = match.group(1)
+                          translated = translate_text(original)
+                          if translated != original and not zh_char_re.search(translated):
+                              changed = True
+                              translated = translated.replace('"', '\\"')
+                              return f'"{translated}"'
+                          return match.group(0)
+
+                      new_content = go_string_re.sub(replacer, content)
+                      
+                      if changed:
+                          with open(filepath, "w", encoding="utf-8") as file:
+                              file.write(new_content)
+                          print(f"Translated strings in: {filepath}")
+
+          with open(CACHE_FILE, "w", encoding="utf-8") as f:
+              json.dump(cache, f, ensure_ascii=False, indent=2)
+          EOF
+
+      - name: 6. Commit and Push English Engine Source
+        run: |
+          git add -f .i18n_go_cache.json .github/ 2>/dev/null || true
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(i18n): sync engine upstream and translate .go sources"
+          fi
+          git push -u origin "${{ env.TARGET_BRANCH }}" --force
+
+      - name: 7. Prepare Tag for Build
+        id: check_release
+        run: |
+          EN_TAG="v$(date +'%Y.%m.%d')-engine-en"
+          git tag -f "${EN_TAG}" HEAD
+          git push origin "refs/tags/${EN_TAG}" --force
+          echo "release_tag=${EN_TAG}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # အဆင့် (၂) - Go ဖြင့် အင်ဂျင်ကို OS မျိုးစုံအတွက် တည်ဆောက်ခြင်း
+  # ---------------------------------------------------------------------------
+  build-engine:
+    name: Build Yaklang Engine (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: sync-and-translate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            output: yak_linux_amd64
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            output: yak_linux_arm64
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+            output: yak_darwin_amd64
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            output: yak_darwin_arm64
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            output: yak_windows_amd64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: 1. Checkout Translated Source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync-and-translate.outputs.release_tag }}
+
+      - name: 2. Setup Golang
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22' 
+          cache: true
+
+      - name: 3. Build Engine Binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          go mod tidy
+          # Yaklang ရဲ့ အဓိက Entrypoint ဖြစ်တဲ့ common/yak/cmd/yak.go ကို Build ခြင်း
+          go build -trimpath -ldflags="-s -w" -o build/${{ matrix.output }} ./common/yak/cmd/yak.go
+
+      - name: 4. Upload Engine Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: build/${{ matrix.output }}
+
+  # ---------------------------------------------------------------------------
+  # အဆင့် (၃) - အင်္ဂလိပ်ဗားရှင်း အင်ဂျင်ကို Release အဖြစ် ထုတ်ပြန်ခြင်း
+  # ---------------------------------------------------------------------------
+  publish-engine-release:
+    name: Publish English Engine Release
+    needs: [sync-and-translate, build-engine]
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Download All Compiled Engines
+        uses: actions/download-artifact@v4
+        with:
+          pattern: engine-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: 2. Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.sync-and-translate.outputs.release_tag }}
+          name: "Yaklang Engine English Edition (${{ needs.sync-and-translate.outputs.release_tag }})"
+          overwrite: true
+          body: |
+            ### Yaklang Core Engine (English Edition)
+            * Translated `.go` source files into English.
+            * Pre-compiled standalone binaries for Yakit Integration.
+          draft: false
+          prerelease: false
+          files: release-assets/*
