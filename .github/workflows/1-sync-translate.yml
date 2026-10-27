@@ -32,7 +32,39 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # ... (ယခင်ကုဒ်အတိုင်း Cache သိမ်းခြင်း၊ Sync လုပ်ခြင်းများ ထည့်ပါ) ...
+
+          # [အဆင့် ၁] မိမိ၏ ကိုယ်ပိုင် Workflow ဖိုင် (၂) ဖိုင်ကို သီးသန့် Backup ယူမည်
+          mkdir -p /tmp/backup
+          cp .github/workflows/1-sync-translate.yml /tmp/backup/ 2>/dev/null || true
+          cp .github/workflows/2-build-release.yml /tmp/backup/ 2>/dev/null || true
+          if [ -f ".i18n_go_cache.json" ]; then
+            cp .i18n_go_cache.json /tmp/backup/.i18n_go_cache.json
+          fi
+
+          # [အဆင့် ၂] Upstream (မူရင်း) မှ ကုဒ်အသစ်များကို ဆွဲယူမည်
+          git remote add upstream "${{ env.UPSTREAM_REPO }}" 2>/dev/null || git remote set-url upstream "${{ env.UPSTREAM_REPO }}"
+          git fetch --no-tags --depth=1 upstream "${{ env.UPSTREAM_BRANCH }}:refs/remotes/upstream/${{ env.UPSTREAM_BRANCH }}"
+          git fetch --no-tags --depth=1 origin "${{ env.TARGET_BRANCH }}:refs/remotes/origin/${{ env.TARGET_BRANCH }}" 2>/dev/null || true
+
+          if git show-ref --verify --quiet "refs/remotes/origin/${{ env.TARGET_BRANCH }}"; then
+            git checkout -B "${{ env.TARGET_BRANCH }}" "origin/${{ env.TARGET_BRANCH }}"
+            git rm -rf --quiet . || true
+            git checkout "refs/remotes/upstream/${{ env.UPSTREAM_BRANCH }}" -- .
+          else
+            git checkout -B "${{ env.TARGET_BRANCH }}" "refs/remotes/upstream/${{ env.UPSTREAM_BRANCH }}"
+          fi
+
+          # [အဆင့် ၃] Upstream မှ ပါလာသော Workflow ဖိုင်များ အားလုံးကို ရှင်းလင်းမည် (အရေးကြီးဆုံးအဆင့်)
+          rm -rf .github/workflows/*
+          mkdir -p .github/workflows
+
+          # [အဆင့် ၄] Backup ယူထားသော မိမိ၏ ဖိုင် (၂) ဖိုင်ကိုသာ ပြန်ထည့်မည်
+          cp /tmp/backup/1-sync-translate.yml .github/workflows/ 2>/dev/null || true
+          cp /tmp/backup/2-build-release.yml .github/workflows/ 2>/dev/null || true
+          
+          if [ -f "/tmp/backup/.i18n_go_cache.json" ]; then
+            cp /tmp/backup/.i18n_go_cache.json .i18n_go_cache.json
+          fi
 
       - name: Setup Python
         uses: actions/setup-python@v5
