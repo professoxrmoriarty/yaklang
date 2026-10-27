@@ -17,7 +17,7 @@ permissions:
 
 env:
   UPSTREAM_REPO: "https://github.com/yaklang/yaklang.git"
-  UPSTREAM_BRANCH: "master"
+  UPSTREAM_BRANCH: "main"
   TARGET_BRANCH: "english-edition"
 
 jobs:
