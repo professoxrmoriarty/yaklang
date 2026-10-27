@@ -1,8 +1,9 @@
-name: Yaklang Engine Sync, Auto-Translate (AI) & Release
+name: Yaklang Engine Progressive Translate & Release
 
 on:
   schedule:
-    - cron: '0 */12 * * *'
+    # ၆ နာရီတစ်ကြိမ် အလိုအလျောက် Run ပြီး Limit ပြည့်မပြည့် စစ်ဆေးမည်
+    - cron: '0 */6 * * *'
   workflow_dispatch:
     inputs:
       force_release:
@@ -22,9 +23,10 @@ env:
 
 jobs:
   sync-and-translate:
-    name: Sync Upstream & Translate Go Source
+    name: Sync, Progressive Translate & Check
     runs-on: ubuntu-latest
     outputs:
+      is_complete: ${{ steps.translate.outputs.is_complete }}
       release_tag: ${{ steps.check_release.outputs.release_tag }}
     steps:
       - name: 1. Checkout Fork Repository
@@ -37,17 +39,18 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          mkdir -p /tmp/backup/workflows
-          cp -r .github/workflows/* /tmp/backup/workflows/ 2>/dev/null || true
-          if [ -f ".i18n_ai_cache.json" ]; then cp .i18n_ai_cache.json /tmp/backup/ || true; fi
+
+          # လက်ရှိ Cache ကို သိမ်းထားမည်
+          mkdir -p /tmp/backup
+          if [ -f ".i18n_go_cache.json" ]; then
+            cp .i18n_go_cache.json /tmp/backup/.i18n_go_cache.json
+          fi
 
           git remote add upstream "${{ env.UPSTREAM_REPO }}" 2>/dev/null || git remote set-url upstream "${{ env.UPSTREAM_REPO }}"
           git fetch --no-tags --depth=1 upstream "${{ env.UPSTREAM_BRANCH }}:refs/remotes/upstream/${{ env.UPSTREAM_BRANCH }}"
           git fetch --no-tags --depth=1 origin "${{ env.TARGET_BRANCH }}:refs/remotes/origin/${{ env.TARGET_BRANCH }}" 2>/dev/null || true
 
           if git show-ref --verify --quiet "refs/remotes/origin/${{ env.TARGET_BRANCH }}"; then
-            git show "origin/${{ env.TARGET_BRANCH }}:.i18n_ai_cache.json" > /tmp/backup/.i18n_ai_cache_prev 2>/dev/null || true
-            if [ -s "/tmp/backup/.i18n_ai_cache_prev" ]; then cp /tmp/backup/.i18n_ai_cache_prev /tmp/backup/.i18n_ai_cache.json; fi
             git checkout -B "${{ env.TARGET_BRANCH }}" "origin/${{ env.TARGET_BRANCH }}"
             git rm -rf --quiet . || true
             git checkout "refs/remotes/upstream/${{ env.UPSTREAM_BRANCH }}" -- .
@@ -55,26 +58,24 @@ jobs:
             git checkout -B "${{ env.TARGET_BRANCH }}" "refs/remotes/upstream/${{ env.UPSTREAM_BRANCH }}"
           fi
 
-          rm -rf .github/workflows/*
-          mkdir -p .github/workflows
-          cp -r /tmp/backup/workflows/* .github/workflows/ 2>/dev/null || true
-          if [ -f "/tmp/backup/.i18n_ai_cache.json" ]; then cp /tmp/backup/.i18n_ai_cache.json .i18n_ai_cache.json; fi
+          # Cache ကို ပြန်ထည့်မည်
+          if [ -f "/tmp/backup/.i18n_go_cache.json" ]; then
+            cp /tmp/backup/.i18n_go_cache.json .i18n_go_cache.json
+          fi
 
-      - name: 3. Setup Python for AI Translation
+      - name: 3. Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 4. Install OpenAI Package
-        run: pip install openai
+      - name: 4. Install Dependencies
+        run: pip install deep-translator
 
-      - name: 5. Safely Translate ONLY NEW Chinese Strings
+      - name: 5. Progressive Translation Script
+        id: translate
         run: |
           python3 - << 'EOF'
-          import os
-          import re
-          import time
-          import json
+          import os, re, time, json, sys
           from deep_translator import GoogleTranslator
 
           translator = GoogleTranslator(source='zh-CN', target='en')
@@ -88,79 +89,139 @@ jobs:
                   with open(CACHE_FILE, 'r', encoding='utf-8') as f:
                       cache = json.load(f)
               except:
-                  cache = {}
+                  pass
+
+          def chunk_list(lst, n):
+              for i in range(0, len(lst), n):
+                  yield lst[i:i + n]
 
           go_files = []
+          strings_to_translate = set()
+
+          print("Phase 1: Scanning files...")
           for root, _, files in os.walk("."):
               if "vendor" in root or ".git" in root or "node_modules" in root:
                   continue
               for f in files:
                   if f.endswith(".go") and not f.endswith("_test.go"):
-                      go_files.append(os.path.join(root, f))
-
-          def process_file(filepath):
-              with open(filepath, "r", encoding="utf-8") as file:
-                  content = file.read()
-              
-              if not zh_char_re.search(content):
-                  return
-              
-              changed = False
-              def replacer(match):
-                  nonlocal changed
-                  original = match.group(1)
-                  
-                  # Cache တွင် မရှိသေးသော အသစ်များကိုသာ Google Translate ဖြင့် ဘာသာပြန်မည်
-                  if original not in cache and len(original) <= 300:
+                      filepath = os.path.join(root, f)
                       try:
-                          cache[original] = translator.translate(original)
-                          time.sleep(1) # API တည်ငြိမ်စေရန်
-                      except:
-                          cache[original] = original
-                          
-                  translated = cache.get(original, original)
-                  if translated != original and not zh_char_re.search(translated):
-                      changed = True
-                      translated = translated.replace('"', '\\"')
-                      return f'"{translated}"'
-                  return match.group(0)
+                          with open(filepath, "r", encoding="utf-8") as file:
+                              content = file.read()
+                          if zh_char_re.search(content):
+                              go_files.append(filepath)
+                              for match in go_string_re.finditer(content):
+                                  text = match.group(1)
+                                  if len(text) <= 300 and text not in cache:
+                                      strings_to_translate.add(text)
+                      except Exception:
+                          continue
 
-              new_content = go_string_re.sub(replacer, content)
-              
-              if changed and new_content != content:
-                  with open(filepath, "w", encoding="utf-8") as file:
-                      file.write(new_content)
-                  print(f"Updated and Translated: {filepath}")
+          strings_list = list(strings_to_translate)
+          print(f"Pending strings to translate: {len(strings_list)}")
 
-          print("Syncing new strings with Google Translate...")
-          for filepath in go_files:
-              process_file(filepath)
+          is_complete = True
+          limit_hit = False
 
-          with open(CACHE_FILE, "w", encoding="utf-8") as f:
-              json.dump(cache, f, ensure_ascii=False, indent=2)
-          print("Incremental Translation complete.")
+          if strings_list:
+              print("Phase 2: Translating...")
+              translated_count = 0
+              for chunk in chunk_list(strings_list, 15):
+                  if limit_hit:
+                      break
+                  try:
+                      translations = translator.translate_batch(chunk)
+                      for orig, trans in zip(chunk, translations):
+                          cache[orig] = trans if trans else orig
+                      
+                      translated_count += len(chunk)
+                      print(f"Progress: {translated_count}/{len(strings_list)} translated.")
+                      
+                      # Save progressively
+                      with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                          json.dump(cache, f, ensure_ascii=False, indent=2)
+                      
+                      time.sleep(2)
+                  except Exception as e:
+                      err_msg = str(e).lower()
+                      if "429" in err_msg or "too many requests" in err_msg:
+                          print("⚠️ Rate limit reached! Pausing translation.")
+                          limit_hit = True
+                          break
+                      else:
+                          # Skip batch on other errors and try next
+                          time.sleep(5)
+
+              if limit_hit or translated_count < len(strings_list):
+                  is_complete = False
+
+          # Export state to GitHub Actions Output
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"is_complete={'true' if is_complete else 'false'}\n")
+
+          # ၁၀၀% ပြီးသွားမှသာ ဖိုင်များထဲသို့ အစားထိုးထည့်သွင်းမည် (Repo ညစ်ပတ်မှုမရှိစေရန်)
+          if is_complete:
+              print("Phase 3: 100% Complete. Replacing strings in source code...")
+              for filepath in go_files:
+                  try:
+                      with open(filepath, "r", encoding="utf-8") as file:
+                          content = file.read()
+                      if not zh_char_re.search(content):
+                          continue
+
+                      def replacer(match):
+                          original = match.group(1)
+                          translated = cache.get(original, original)
+                          if translated != original and not zh_char_re.search(translated):
+                              translated = translated.replace('"', '\\"')
+                              return f'"{translated}"'
+                          return match.group(0)
+
+                      new_content = go_string_re.sub(replacer, content)
+                      if new_content != content:
+                          with open(filepath, "w", encoding="utf-8") as file:
+                              file.write(new_content)
+                  except Exception:
+                      continue
+              print("Source code updated successfully!")
+          else:
+              print("Translation is incomplete. Will resume on next run.")
           EOF
 
-      - name: 6. Commit and Push English Engine Source
+      - name: 6. Commit Cache or Fully Localized Code
         run: |
-          git add -f .i18n_ai_cache.json .github/ 2>/dev/null || true
-          git add -A
-          if ! git diff --cached --quiet; then
-            git commit -m "chore(i18n): sync engine upstream and translate .go sources via AI"
+          git add -f .i18n_go_cache.json .github/ 2>/dev/null || true
+          
+          if [ "${{ steps.translate.outputs.is_complete }}" == "false" ]; then
+            # မပြီးသေးပါက Cache ဖိုင်တစ်ခုတည်းကိုသာ သိမ်းမည် (.go ဖိုင်များကို လျစ်လျူရှုမည်)
+            git commit -m "chore(i18n): save translation progress (incomplete) [skip ci]" || true
+            git push -u origin "${{ env.TARGET_BRANCH }}" --force
+            echo "Translation paused. Not building release yet."
+          else
+            # ၁၀၀% ပြီးသွားပါက ပြင်ဆင်ထားသော .go ဖိုင်များအားလုံးကို Commit တင်မည်
+            git add -A
+            if ! git diff --cached --quiet; then
+              git commit -m "feat(i18n): translation 100% complete, synced upstream"
+            fi
+            git push -u origin "${{ env.TARGET_BRANCH }}" --force
           fi
-          git push -u origin "${{ env.TARGET_BRANCH }}" --force
 
-      - name: 7. Prepare Tag for Build
+      - name: 7. Prepare Tag for Build (Only if Complete)
         id: check_release
+        if: steps.translate.outputs.is_complete == 'true' || inputs.force_release == true
         run: |
           EN_TAG="v$(date +'%Y.%m.%d')-engine-en"
           git tag -f "${EN_TAG}" HEAD
           git push origin "refs/tags/${EN_TAG}" --force
           echo "release_tag=${EN_TAG}" >> "$GITHUB_OUTPUT"
 
+  # ---------------------------------------------------------------------------
+  # အဆင့် (၂) - ၁၀၀% ဘာသာပြန်ပြီးမှသာ Engine ကို Build လုပ်မည်
+  # ---------------------------------------------------------------------------
   build-engine:
     name: Build Yaklang Engine (${{ matrix.goos }}/${{ matrix.goarch }})
     needs: sync-and-translate
+    if: needs.sync-and-translate.outputs.is_complete == 'true' || inputs.force_release == true
     strategy:
       fail-fast: false
       matrix:
@@ -187,18 +248,18 @@ jobs:
             output: yak_windows_amd64.exe
     runs-on: ${{ matrix.os }}
     steps:
-      - name: 1. Checkout Translated Source
+      - name: Checkout Source
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.sync-and-translate.outputs.release_tag }}
 
-      - name: 2. Setup Golang
+      - name: Setup Golang
         uses: actions/setup-go@v5
         with:
           go-version: '1.22' 
           cache: true
 
-      - name: 3. Build Engine Binary
+      - name: Build Engine Binary
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
@@ -207,7 +268,7 @@ jobs:
           go mod tidy
           go build -trimpath -ldflags="-s -w" -o build/${{ matrix.output }} ./common/yak/cmd/yak.go
 
-      - name: 4. Upload Engine Artifact
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: engine-${{ matrix.goos }}-${{ matrix.goarch }}
@@ -216,16 +277,17 @@ jobs:
   publish-engine-release:
     name: Publish English Engine Release
     needs: [sync-and-translate, build-engine]
+    if: needs.sync-and-translate.outputs.is_complete == 'true' || inputs.force_release == true
     runs-on: ubuntu-latest
     steps:
-      - name: 1. Download All Compiled Engines
+      - name: Download Artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: engine-*
           path: release-assets
           merge-multiple: true
 
-      - name: 2. Publish to GitHub Releases
+      - name: Publish Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.sync-and-translate.outputs.release_tag }}
@@ -233,7 +295,7 @@ jobs:
           overwrite: true
           body: |
             ### Yaklang Core Engine (English Edition)
-            * Translated `.go` source files into English using **OpenRouter AI (Qwen-2.5)**.
+            * 100% Fully translated `.go` source files into English.
             * Pre-compiled standalone binaries for Yakit Integration.
           draft: false
           prerelease: false
