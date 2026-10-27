@@ -1,0 +1,86 @@
+name: 2. Build & Publish Engine Release
+
+on:
+  push:
+    tags:
+      - 'v*-engine-en' # 'v' ဖြင့်စပြီး 'engine-en' ဖြင့်ဆုံးသော Tag များဝင်လာမှသာ Run မည်
+
+permissions:
+  contents: write
+
+jobs:
+  build-engine:
+    name: Build Yaklang Engine (${{ matrix.goos }}/${{ matrix.goarch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            output: yak_linux_amd64
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            output: yak_linux_arm64
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+            output: yak_darwin_amd64
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            output: yak_darwin_arm64
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            output: yak_windows_amd64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout Tagged Source
+        uses: actions/checkout@v4
+
+      - name: Setup Golang
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22' 
+          cache: true
+
+      - name: Build Engine Binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          go mod tidy
+          go build -trimpath -ldflags="-s -w" -o build/${{ matrix.output }} ./common/yak/cmd/yak.go
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: build/${{ matrix.output }}
+
+  publish-engine-release:
+    name: Publish English Engine Release
+    needs: build-engine
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: engine-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish Release to GitHub
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Yaklang Engine English Edition (${{ github.ref_name }})"
+          body: |
+            ### Yaklang Core Engine (English Edition)
+            * 100% Fully translated `.go` source files into English.
+            * Pre-compiled standalone binaries for Yakit Integration.
+          draft: false
+          prerelease: false
+          files: release-assets/*
