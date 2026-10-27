@@ -68,36 +68,20 @@ jobs:
       - name: 4. Install OpenAI Package
         run: pip install openai
 
-      - name: 5. Translate Chinese Strings via OpenRouter (Auto-Fallback)
-        env:
-          AI_API_KEY: ${{ secrets.AI_API_KEY }}
-          AI_BASE_URL: "https://openrouter.ai/api/v1"
+      - name: 5. Safely Translate ONLY NEW Chinese Strings
         run: |
           python3 - << 'EOF'
           import os
           import re
           import time
           import json
-          from openai import OpenAI
+          from deep_translator import GoogleTranslator
 
-          client = OpenAI(
-              api_key=os.environ.get("AI_API_KEY"),
-              base_url=os.environ.get("AI_BASE_URL")
-          )
-
-          # ၁၀၀% အလုပ်ဖြစ်စေရန် Free Model (၅) ခု ထည့်ထားသည်။ တစ်ခုပျက်ပါက နောက်တစ်ခုသို့ အလိုအလျောက် ပြောင်းမည်။
-          FREE_MODELS = [
-              "google/gemini-2.0-flash-lite-preview-02-05:free",
-              "mistralai/mistral-nemo:free",
-              "meta-llama/llama-3.2-3b-instruct:free",
-              "qwen/qwen-2.5-coder-32b-instruct:free",
-              "microsoft/phi-3-mini-128k-instruct:free"
-          ]
-
+          translator = GoogleTranslator(source='zh-CN', target='en')
           zh_char_re = re.compile(r'[\u4e00-\u9fff]')
           go_string_re = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*[\u4e00-\u9fff]+[^"\\]*(?:\\.[^"\\]*)*)"')
 
-          CACHE_FILE = ".i18n_ai_cache.json"
+          CACHE_FILE = ".i18n_go_cache.json"
           cache = {}
           if os.path.exists(CACHE_FILE):
               try:
@@ -106,116 +90,55 @@ jobs:
               except:
                   cache = {}
 
-          def chunk_list(lst, n):
-              for i in range(0, len(lst), n):
-                  yield lst[i:i + n]
-
-          strings_to_translate = set()
           go_files = []
-
-          print("Phase 1: Scanning for Chinese strings...")
-          total_strings = 0
           for root, _, files in os.walk("."):
               if "vendor" in root or ".git" in root or "node_modules" in root:
                   continue
               for f in files:
                   if f.endswith(".go") and not f.endswith("_test.go"):
-                      filepath = os.path.join(root, f)
-                      go_files.append(filepath)
-                      with open(filepath, "r", encoding="utf-8") as file:
-                          content = file.read()
-                      if zh_char_re.search(content):
-                          for match in go_string_re.finditer(content):
-                              text = match.group(1)
-                              if len(text) <= 300:
-                                  total_strings += 1
-                                  if text not in cache:
-                                      strings_to_translate.add(text)
+                      go_files.append(os.path.join(root, f))
 
-          strings_list = list(strings_to_translate)
-          already_translated = total_strings - len(strings_list)
-          
-          print(f"Total strings: {total_strings}, Skipped: {already_translated}, New to translate: {len(strings_list)}")
-
-          if strings_list:
-              print("Phase 2: Translating in batches using Auto-Fallback...")
-              for chunk in chunk_list(strings_list, 20):
-                  system_prompt = "You are a cybersecurity software localization expert. Translate the following JSON array of Chinese strings into English. Keep variables like %s, %d, and formatting intact. Respond ONLY with a valid JSON array of strings in the exact same order. Do not include markdown formatting or explanations."
-                  user_prompt = json.dumps(chunk, ensure_ascii=False)
-                  
-                  success = False
-                  # မော်ဒယ်တစ်ခုချင်းစီကို အလုပ်လုပ်သည်အထိ လှည့်ပတ်စမ်းသပ်မည်
-                  for model_name in FREE_MODELS:
-                      if success: break
-                      for attempt in range(2):
-                          try:
-                              response = client.chat.completions.create(
-                                  model=model_name,
-                                  messages=[
-                                      {"role": "system", "content": system_prompt},
-                                      {"role": "user", "content": user_prompt}
-                                  ],
-                                  temperature=0.1
-                              )
-                              
-                              result_text = response.choices[0].message.content.strip()
-                              if result_text.startswith("```json"):
-                                  result_text = result_text[7:-3].strip()
-                              elif result_text.startswith("```"):
-                                  result_text = result_text[3:-3].strip()
-                                  
-                              translated_chunk = json.loads(result_text)
-                              
-                              if len(translated_chunk) == len(chunk):
-                                  for orig, trans in zip(chunk, translated_chunk):
-                                      cache[orig] = trans
-                                  with open(CACHE_FILE, "w", encoding="utf-8") as f:
-                                      json.dump(cache, f, ensure_ascii=False, indent=2)
-                                  success = True
-                                  break # ဤအသုတ် အောင်မြင်သွားပြီဖြစ်၍ ရပ်မည်
-                              else:
-                                  raise ValueError("Array length mismatch")
-                                  
-                          except Exception as e:
-                              error_msg = str(e)
-                              print(f"[{model_name}] error: {error_msg}")
-                              # 404 သို့မဟုတ် 429 တက်ပါက ချက်ချင်း နောက်မော်ဒယ်တစ်ခုသို့ ကူးပြောင်းမည်
-                              if "404" in error_msg or "429" in error_msg:
-                                  break 
-                              time.sleep(2)
-                  
-                  if not success:
-                      print("Warning: All free models failed for this chunk. Skipping to next chunk...")
-                  
-                  time.sleep(1)
-
-          print("Phase 3: Replacing strings in source files...")
-          
           def process_file(filepath):
               with open(filepath, "r", encoding="utf-8") as file:
                   content = file.read()
+              
               if not zh_char_re.search(content):
                   return
               
+              changed = False
               def replacer(match):
+                  nonlocal changed
                   original = match.group(1)
+                  
+                  # Cache တွင် မရှိသေးသော အသစ်များကိုသာ Google Translate ဖြင့် ဘာသာပြန်မည်
+                  if original not in cache and len(original) <= 300:
+                      try:
+                          cache[original] = translator.translate(original)
+                          time.sleep(1) # API တည်ငြိမ်စေရန်
+                      except:
+                          cache[original] = original
+                          
                   translated = cache.get(original, original)
                   if translated != original and not zh_char_re.search(translated):
+                      changed = True
                       translated = translated.replace('"', '\\"')
                       return f'"{translated}"'
                   return match.group(0)
 
               new_content = go_string_re.sub(replacer, content)
               
-              if new_content != content:
+              if changed and new_content != content:
                   with open(filepath, "w", encoding="utf-8") as file:
                       file.write(new_content)
-                  print(f"Translated: {filepath}")
+                  print(f"Updated and Translated: {filepath}")
 
+          print("Syncing new strings with Google Translate...")
           for filepath in go_files:
               process_file(filepath)
 
-          print("Translation complete.")
+          with open(CACHE_FILE, "w", encoding="utf-8") as f:
+              json.dump(cache, f, ensure_ascii=False, indent=2)
+          print("Incremental Translation complete.")
           EOF
 
       - name: 6. Commit and Push English Engine Source
