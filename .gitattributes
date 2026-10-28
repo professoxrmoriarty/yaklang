@@ -15,5 +15,7 @@ common/bin-parser/testdata/protocol-native/** -text
 common/pcapx/pcaputil/testdata/protocol-sessions/**/*.keys -text
 # Independent TShark exports preserve empty trailing columns.
 scripts/protocol-tests/generate-dcerpc-session/*.tsv -text whitespace=-blank-at-eol
+
 .github/workflows/* merge=ours
 README.md merge=ours
+.github/workflows/security_glossary.json merge=ours
