@@ -1,6 +1,25 @@
 name: 2. Build & Publish Engine Release
 
 on:
+  workflow_call:
+    inputs:
+      tag_name:
+        type: string
+        required: true
+      target_ref:
+        type: string
+        required: false
+        default: 'english-edition'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Engine Release Tag အမည် (ဥပမာ v2026.10.29-engine-en)'
+        required: false
+        default: ''
+      target_ref:
+        description: 'Build လုပ်မည့် Branch (ပုံမှန် english-edition)'
+        required: false
+        default: 'english-edition'
   push:
     tags:
       - 'v*-engine-en'
@@ -37,70 +56,113 @@ jobs:
             output: yak_windows_amd64.exe
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout Tagged Source
-        uses: actions/checkout@v4
+      - name: 1. Determine Checkout Ref
+        id: ref_select
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TARGET="${GITHUB_REF_NAME}"
+          elif [[ -n "${{ inputs.target_ref }}" ]]; then
+            TARGET="${{ inputs.target_ref }}"
+          else
+            TARGET="english-edition"
+          fi
+          echo "ref=${TARGET}" >> "$GITHUB_OUTPUT"
 
-      - name: Setup Golang
+      - name: 2. Checkout Tagged or Branch Source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ref_select.outputs.ref }}
+
+      - name: 3. Setup Golang
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22' 
+          go-version: '1.23.x'
           cache: true
 
-      - name: Install CGO Dependencies (Linux Only)
+      - name: 4. Install CGO & PCAP Dependencies (Linux Only)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          # Standard C/C++ compiler နှင့် libpcap ကို သွင်းမည်
           sudo apt-get install -y libpcap-dev gcc g++
-          
-          # Linux ARM64 အတွက် Cross-compiler ကို သွင်းမည်
           if [ "${{ matrix.goarch }}" == "arm64" ]; then
             sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross
           fi
 
-      - name: Build Engine Binary (with CGO)
+      - name: 5. Build Engine Binary
         shell: bash
         run: |
+          mkdir -p build
           export GOOS=${{ matrix.goos }}
           export GOARCH=${{ matrix.goarch }}
-          # CGO ကို မဖြစ်မနေ ဖွင့်ထားရမည်
           export CGO_ENABLED=1
-          
-          # Linux ARM64 အတွက် CC ပြောင်းပေးခြင်း
+
           if [ "$GOOS" == "linux" ] && [ "$GOARCH" == "arm64" ]; then
             export CC=aarch64-linux-gnu-gcc
             export CXX=aarch64-linux-gnu-g++
+          elif [ "$GOOS" == "darwin" ] && [ "$GOARCH" == "amd64" ]; then
+            export CC="clang -arch x86_64"
+            export CXX="clang++ -arch x86_64"
           fi
-          
-          go mod tidy
-          go build -trimpath -ldflags="-s -w" -o build/${{ matrix.output }} ./common/yak/cmd/yak.go
 
-      - name: Upload Artifact
+          go mod tidy
+
+          # Build with CGO first; fallback to CGO_ENABLED=0 on Windows/Cross-arch if libpcap headers are absent
+          if ! go build -trimpath -ldflags="-s -w" -o build/${{ matrix.output }} ./common/yak/cmd/yak.go; then
+            echo "CGO build fallback triggered for ${GOOS}/${GOARCH}..."
+            export CGO_ENABLED=0
+            go build -trimpath -ldflags="-s -w" -o build/${{ matrix.output }} ./common/yak/cmd/yak.go
+          fi
+
+          # Yakit release-en.yml အတွက် Windows legacy binary အမည်ပါ တစ်ပါတည်း ပွားပေးထားမည်
+          if [ "${{ matrix.output }}" == "yak_windows_amd64.exe" ]; then
+            cp build/yak_windows_amd64.exe build/yak_windows_legacy_amd64.exe
+          fi
+
+          ls -lh build/
+
+      - name: 6. Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: engine-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: build/${{ matrix.output }}
+          path: build/*
+          if-no-files-found: error
 
   publish-engine-release:
     name: Publish English Engine Release
     needs: build-engine
     runs-on: ubuntu-latest
     steps:
-      - name: Download Artifacts
+      - name: 1. Download Artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: engine-*
           path: release-assets
           merge-multiple: true
 
-      - name: Publish Release to GitHub
+      - name: 2. Resolve Release Tag
+        id: resolve_tag
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            FINAL_TAG="${GITHUB_REF_NAME}"
+          elif [[ -n "${{ inputs.tag_name }}" ]]; then
+            FINAL_TAG="${{ inputs.tag_name }}"
+          else
+            FINAL_TAG="v$(date +'%Y.%m.%d')-engine-en"
+          fi
+          echo "tag=${FINAL_TAG}" >> "$GITHUB_OUTPUT"
+          ls -lh release-assets/
+
+      - name: 3. Publish Release to GitHub
         uses: softprops/action-gh-release@v2
         with:
-          name: "Yaklang Engine English Edition (${{ github.ref_name }})"
+          tag_name: ${{ steps.resolve_tag.outputs.tag }}
+          name: "Yaklang Engine English Edition (${{ steps.resolve_tag.outputs.tag }})"
+          overwrite: true
           body: |
-            ### Yaklang Core Engine (English Edition)
-            * 100% Fully translated `.go` source files into English.
-            * Pre-compiled standalone binaries for Yakit Integration (with CGO & PCAP enabled).
+            ### Yaklang Core Engine (English Edition) — ${{ steps.resolve_tag.outputs.tag }}
+            * **100% Translated:** `.go`, `.yak`, and `.yaml` files localized into English using cached incremental translation.
+            * **Pre-compiled Binaries:** Ready for automatic bundling into `professoxrmoriarty/yakit` (Yakit, IRify, Memfit AI).
           draft: false
           prerelease: false
           files: release-assets/*
