@@ -1,14 +1,15 @@
-name: 1. Progressive Translate
+name: 1. Smart Diff Sync & Progressive Translate (Yaklang Engine)
 
 on:
   schedule:
+    # ၆ နာရီခြား တစ်ကြိမ် အလိုအလျောက် Run ပြီး ရပ်ထားသည့်နေရာမှ ဆက်ဘာသာပြန်ပေးမည်
     - cron: '0 */6 * * *'
   workflow_dispatch:
     inputs:
       force_release:
-        description: 'Release အသစ် အတင်းထုတ်မည်လား? (true ရွေးပါ)'
-        type: boolean
-        default: false
+        description: '၁၀၀% မပြီးသေးလည်း Engine Release အတင်းထုတ်မည်လား? (true/false)'
+        required: false
+        default: 'false'
 
 permissions:
   contents: write
@@ -21,83 +22,463 @@ env:
 
 jobs:
   sync-and-translate:
+    name: Smart Diff Sync & Progressive Translate Go Engine
     runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check_release.outputs.should_release }}
+      release_tag: ${{ steps.check_release.outputs.release_tag }}
     steps:
-      - name: Checkout Fork Repository
+      - name: 1. Checkout Fork Repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
-          token: ${{ secrets.PAT_TOKEN }}
-      - name: Configure Git & Sync Upstream
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: 2. Configure Git & Fetch Upstream Diffs
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "${{ env.UPSTREAM_REPO }}" 2>/dev/null || git remote set-url upstream "${{ env.UPSTREAM_REPO }}"
+          git fetch upstream "${{ env.UPSTREAM_BRANCH }}" --tags || git fetch upstream master --tags
 
-          # [အဆင့် ၁] မိမိ၏ ကိုယ်ပိုင် Workflow ဖိုင် (၂) ဖိုင်ကို သီးသန့် Backup ယူမည်
-          mkdir -p /tmp/backup
-          cp .github/workflows/1-sync-translate.yml /tmp/backup/ 2>/dev/null || true
-          cp .github/workflows/2-build-release.yml /tmp/backup/ 2>/dev/null || true
+      - name: 3. Merge Upstream Diff Changes Only (Preserve Workflows & Cache)
+        run: |
+          mkdir -p /tmp/backup/workflows
+          cp -r .github/workflows/* /tmp/backup/workflows/ 2>/dev/null || true
+          if [ -f ".github/security_glossary.json" ]; then
+            cp .github/security_glossary.json /tmp/backup/security_glossary.json
+          fi
           if [ -f ".i18n_go_cache.json" ]; then
             cp .i18n_go_cache.json /tmp/backup/.i18n_go_cache.json
           fi
-
-          # [အဆင့် ၂] Upstream (မူရင်း) မှ ကုဒ်အသစ်များကို ဆွဲယူမည်
-          git remote add upstream "${{ env.UPSTREAM_REPO }}" 2>/dev/null || git remote set-url upstream "${{ env.UPSTREAM_REPO }}"
-          git fetch --no-tags --depth=1 upstream "${{ env.UPSTREAM_BRANCH }}:refs/remotes/upstream/${{ env.UPSTREAM_BRANCH }}"
-          git fetch --no-tags --depth=1 origin "${{ env.TARGET_BRANCH }}:refs/remotes/origin/${{ env.TARGET_BRANCH }}" 2>/dev/null || true
-
-          if git show-ref --verify --quiet "refs/remotes/origin/${{ env.TARGET_BRANCH }}"; then
-            git checkout -B "${{ env.TARGET_BRANCH }}" "origin/${{ env.TARGET_BRANCH }}"
-            git rm -rf --quiet . || true
-            git checkout "refs/remotes/upstream/${{ env.UPSTREAM_BRANCH }}" -- .
-          else
-            git checkout -B "${{ env.TARGET_BRANCH }}" "refs/remotes/upstream/${{ env.UPSTREAM_BRANCH }}"
+          if [ -f ".i18n_cache.json" ]; then
+            cp .i18n_cache.json /tmp/backup/.i18n_cache.json
+          fi
+          if [ -f "README.md" ]; then
+            cp README.md /tmp/backup/README.md
           fi
 
-          # [အဆင့် ၃] Upstream မှ ပါလာသော Workflow ဖိုင်များ အားလုံးကို ရှင်းလင်းမည် (အရေးကြီးဆုံးအဆင့်)
+          UP_REF="upstream/${{ env.UPSTREAM_BRANCH }}"
+          if ! git rev-parse --verify "$UP_REF" >/dev/null 2>&1; then
+            UP_REF="upstream/master"
+          fi
+
+          # မူရင်း Repo တစ်ခုလုံးကို ပြန်မဆွဲဘဲ ပြောင်းလဲသွားသော Diff များကိုသာ Merge လုပ်မည်
+          if ! git merge "$UP_REF" -X theirs --allow-unrelated-histories --no-edit; then
+            git status --porcelain | awk '$1=="DU" || $1=="UD" {print $2}' | xargs -r git rm -f
+            git checkout --theirs . || true
+            git add -A
+            git commit --no-edit || true
+          fi
+
+          # Upstream မှ ပါလာသော workflows များကို ရှင်းပြီး မိမိ၏ ဖိုင်များကို ပြန်ထည့်မည်
           rm -rf .github/workflows/*
           mkdir -p .github/workflows
-
-          # [အဆင့် ၄] Backup ယူထားသော မိမိ၏ ဖိုင် (၂) ဖိုင်ကိုသာ ပြန်ထည့်မည်
-          cp /tmp/backup/1-sync-translate.yml .github/workflows/ 2>/dev/null || true
-          cp /tmp/backup/2-build-release.yml .github/workflows/ 2>/dev/null || true
-          
+          cp -r /tmp/backup/workflows/* .github/workflows/ 2>/dev/null || true
+          if [ -f "/tmp/backup/security_glossary.json" ]; then
+            cp /tmp/backup/security_glossary.json .github/security_glossary.json
+          fi
           if [ -f "/tmp/backup/.i18n_go_cache.json" ]; then
             cp /tmp/backup/.i18n_go_cache.json .i18n_go_cache.json
           fi
+          if [ -f "/tmp/backup/.i18n_cache.json" ]; then
+            cp /tmp/backup/.i18n_cache.json .i18n_cache.json
+          fi
+          if [ -f "/tmp/backup/README.md" ]; then
+            cp /tmp/backup/README.md README.md
+          fi
 
-      - name: Setup Python
+          if [ -n "$(git status --porcelain)" ]; then
+            git add .github/ .i18n_go_cache.json .i18n_cache.json README.md 2>/dev/null || true
+            git commit -m "chore(sync): merge upstream yaklang diff changes" || true
+          fi
+
+      - name: 4. Setup Golang (For gofmt Syntax Verification)
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+
+      - name: 5. Setup Python & Install Translation Dependencies
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install Dependencies
-        run: pip install deep-translator
+      - name: 6. Install Python Libraries
+        run: |
+          python3 -m pip install --upgrade pip deep-translator PyYAML
 
-      - name: Progressive Translation Script
+      - name: 7. Progressive Translation (Stop on Limit, Save Cache & Resume)
         id: translate
         run: |
-          # ... (ယခင် Python Script အတိုင်း အတိအကျ ထည့်ပါ) ...
-          # ပြီးဆုံးပါက is_complete ကို output အနေဖြင့် ထုတ်ပေးပါမည်
+          python3 - << 'EOF'
+          import os
+          import re
+          import json
+          import time
+          import yaml
+          from deep_translator import GoogleTranslator
 
-      - name: Commit Cache or Fully Localized Code
+          GO_CACHE_FILE = ".i18n_go_cache.json"
+          SHARED_CACHE_FILE = ".i18n_cache.json"
+          GLOSSARY_FILE = ".github/security_glossary.json"
+          META_KEY = "__glossary_snapshot__"
+
+          # တစ်ကြိမ် Run လျှင် အများဆုံး ၄၅ မိနစ် သို့မဟုတ် Rate Limit ၅ ကြိမ်ဆက်တိုက်ထိပါက ရပ်ပြီး Cache သိမ်းမည်
+          START_TIME = time.time()
+          MAX_RUNTIME_SECONDS = 45 * 60
+          MAX_CONSECUTIVE_FAILURES = 5
+
+          IGNORE_DIRS = {".git", ".github", "vendor", "node_modules", "build", "dist", "testdata"}
+
+          translator = GoogleTranslator(source='zh-CN', target='en')
+          zh_char_re = re.compile(r'[\u4e00-\u9fff]')
+          multi_space_re = re.compile(r' {2,}')
+
+          def has_zh(text):
+              return bool(zh_char_re.search(str(text)))
+
+          # 1. Load Security Glossary
+          exact_glossary = {}
+          inline_glossary = {}
+          post_fix_patterns = []
+
+          if os.path.exists(GLOSSARY_FILE):
+              try:
+                  with open(GLOSSARY_FILE, 'r', encoding='utf-8') as f:
+                      g_data = json.load(f)
+                  for _, mapping in g_data.get("terms", {}).items():
+                      if isinstance(mapping, dict):
+                          exact_glossary.update(mapping)
+                          inline_glossary.update(mapping)
+                  exact_glossary.update(g_data.get("exact_only", {}))
+                  for pat, repl in g_data.get("post_fixes", {}).items():
+                      post_fix_patterns.append((re.compile(pat, re.IGNORECASE), repl))
+              except Exception:
+                  pass
+
+          sorted_inline_keys = sorted(inline_glossary.keys(), key=len, reverse=True)
+
+          # 2. Load Existing Cache (.i18n_go_cache.json နှင့် .i18n_cache.json နှစ်ခုလုံးကို ပေါင်းစပ်ဖတ်မည်)
+          cache = {}
+          for cfile in (SHARED_CACHE_FILE, GO_CACHE_FILE):
+              if os.path.exists(cfile):
+                  try:
+                      with open(cfile, 'r', encoding='utf-8') as f:
+                          data = json.load(f)
+                          if isinstance(data, dict):
+                              cache.update(data)
+                  except Exception:
+                      pass
+
+          prev_snapshot = cache.get(META_KEY, {}) if isinstance(cache.get(META_KEY), dict) else {}
+          current_snapshot = {**inline_glossary, **exact_glossary}
+
+          changed_terms = [
+              zh_k for zh_k, en_v in current_snapshot.items()
+              if prev_snapshot.get(zh_k) != en_v
+          ]
+
+          if changed_terms:
+              for k in list(cache.keys()):
+                  if k != META_KEY and any(term in k for term in changed_terms):
+                      del cache[k]
+
+          def save_cache_checkpoint():
+              cache[META_KEY] = current_snapshot
+              for cfile in (GO_CACHE_FILE, SHARED_CACHE_FILE):
+                  with open(cfile, 'w', encoding='utf-8') as f:
+                      json.dump(cache, f, ensure_ascii=False, indent=2)
+
+          # Go format specifiers (%s, %d, %v, %w, {{...}}) မပျက်စေရန် Mask လုပ်ခြင်း
+          placeholder_re = re.compile(r'(\{\{.*?\}\}|%[+#0 -]*\d*(?:\.\d+)?[svTtbcdoqxXUeEfFgGp%]|\\[nrt"\\])')
+
+          def pre_process_glossary(text):
+              stripped = text.strip()
+              if stripped in exact_glossary:
+                  return exact_glossary[stripped], False
+              out = text
+              for zh_term in sorted_inline_keys:
+                  if zh_term in out:
+                      out = out.replace(zh_term, f" {inline_glossary[zh_term]} ")
+              out = multi_space_re.sub(' ', out).strip()
+              return out, has_zh(out)
+
+          def post_process_glossary(text):
+              out = text
+              for regex, repl in post_fix_patterns:
+                  out = regex.sub(repl, out)
+              out = re.sub(r'\s+([,.:;!?)])', r'\1', out)
+              out = re.sub(r'([(\[])\s+', r'\1', out)
+              return multi_space_re.sub(' ', out).strip()
+
+          def translate_preserving_placeholders(text):
+              tokens = []
+              def mask_fn(m):
+                  tokens.append(m.group(0))
+                  return f"__PH{len(tokens)-1}__"
+
+              masked = placeholder_re.sub(mask_fn, text)
+              pre_text, needs_mt = pre_process_glossary(masked)
+              if needs_mt:
+                  res = translator.translate(pre_text)
+                  if not res:
+                      return None
+                  out = post_process_glossary(res)
+              else:
+                  out = post_process_glossary(pre_text)
+
+              for idx, tok in enumerate(tokens):
+                  out = re.sub(rf'__PH{idx}__', lambda _: tok, out, flags=re.IGNORECASE)
+              return out
+
+          limit_reached = False
+
+          def batch_translate(texts, stage_name=""):
+              global limit_reached
+              if limit_reached:
+                  return
+
+              unique_new = [
+                  t for t in texts
+                  if (t not in cache or has_zh(cache.get(t, ""))) and has_zh(t) and len(t) <= 500
+              ]
+              if not unique_new:
+                  print(f"[{stage_name}] All strings already in cache! Nothing new to translate.")
+                  return
+
+              print(f"[{stage_name}] Translating {len(unique_new)} uncached strings...")
+              BATCH_SIZE = 25
+              consecutive_failures = 0
+
+              for i in range(0, len(unique_new), BATCH_SIZE):
+                  if time.time() - START_TIME > MAX_RUNTIME_SECONDS:
+                      print("Time limit reached! Pausing and saving cache checkpoint...")
+                      limit_reached = True
+                      break
+                  if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                      print("Rate limit reached! Pausing and saving cache checkpoint for next run...")
+                      limit_reached = True
+                      break
+
+                  batch = unique_new[i:i + BATCH_SIZE]
+                  for orig in batch:
+                      if time.time() - START_TIME > MAX_RUNTIME_SECONDS or consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                          limit_reached = True
+                          break
+                      try:
+                          trans = translate_preserving_placeholders(orig)
+                          if trans and not has_zh(trans):
+                              cache[orig] = trans
+                              consecutive_failures = 0
+                          else:
+                              consecutive_failures += 1
+                      except Exception:
+                          consecutive_failures += 1
+                          time.sleep(1.5)
+
+                  # Batch တစ်ခုပြီးတိုင်း Cache ချက်ချင်းသိမ်းမည်
+                  save_cache_checkpoint()
+                  done_count = min(i + BATCH_SIZE, len(unique_new))
+                  print(f"[{stage_name}] Progress: {done_count}/{len(unique_new)} saved to cache.")
+                  time.sleep(0.4)
+
+          # ==========================================
+          # 1. Scan & Translate Go (.go) and Yak (.yak) Files
+          # ==========================================
+          # Comments (//, /* */), Raw struct tags (`...`), and Double-quoted strings ("...")
+          GO_TOKEN_RE = re.compile(
+              r'(//[^\n]*|/\*[\s\S]*?\*/)'
+              r'|(`[^`]*`)'
+              r'|("(?:\\.|[^"\\\n])*")'
+          )
+
+          go_files = []
+          go_zh_strings = set()
+          yaml_files = []
+          yaml_zh_strings = set()
+
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+              for file in files:
+                  full_path = os.path.join(root, file)
+                  if file.endswith(('.go', '.yak')) and not file.endswith('_test.go'):
+                      try:
+                          with open(full_path, 'r', encoding='utf-8') as f:
+                              content = f.read()
+                      except Exception:
+                          continue
+                      if not has_zh(content):
+                          continue
+                      file_has_target = False
+                      for m in GO_TOKEN_RE.finditer(content):
+                          comment, raw_str, dq_str = m.groups()
+                          if comment or raw_str:
+                              continue
+                          if dq_str and has_zh(dq_str):
+                              inner = dq_str[1:-1]
+                              if len(inner) <= 500:
+                                  go_zh_strings.add(inner)
+                                  file_has_target = True
+                      if file_has_target:
+                          go_files.append(full_path)
+
+                  elif file.endswith(('.yml', '.yaml')):
+                      try:
+                          with open(full_path, 'r', encoding='utf-8') as f:
+                              raw_yaml = f.read()
+                      except Exception:
+                          continue
+                      if not has_zh(raw_yaml):
+                          continue
+                      try:
+                          data = yaml.safe_load(raw_yaml)
+                          if isinstance(data, dict):
+                              for field in ['name', 'description', 'solution', 'title', 'summary', 'author']:
+                                  val = data.get(field)
+                                  if isinstance(val, str) and has_zh(val):
+                                      yaml_zh_strings.add(val)
+                              info_block = data.get('info')
+                              if isinstance(info_block, dict):
+                                  for field in ['name', 'description', 'solution', 'author', 'summary']:
+                                      val = info_block.get(field)
+                                      if isinstance(val, str) and has_zh(val):
+                                          yaml_zh_strings.add(val)
+                              yaml_files.append(full_path)
+                      except Exception:
+                          continue
+
+          batch_translate(list(go_zh_strings), "Go & Yak Engine Files")
+          batch_translate(list(yaml_zh_strings), "YAML PoC & Configs")
+
+          def sanitize_go_dq(text):
+              text = text.replace('\r', ' ').replace('\n', '\\n')
+              # Preserve existing escaped quotes and escape unescaped double quotes
+              text = re.sub(r'(?<!\\)"', r'\"', text)
+              return text
+
+          for full_path in go_files:
+              try:
+                  with open(full_path, 'r', encoding='utf-8') as f:
+                      content = f.read()
+                  def replacer(m):
+                      comment, raw_str, dq_str = m.groups()
+                      if comment or raw_str:
+                          return m.group(0)
+                      if dq_str and has_zh(dq_str):
+                          inner = dq_str[1:-1]
+                          if inner in cache and not has_zh(cache[inner]):
+                              trans = sanitize_go_dq(cache[inner])
+                              return f'"{trans}"'
+                      return m.group(0)
+
+                  new_content = GO_TOKEN_RE.sub(replacer, content)
+                  if new_content != content:
+                      with open(full_path, 'w', encoding='utf-8') as f:
+                          f.write(new_content)
+              except Exception:
+                  pass
+
+          for full_path in yaml_files:
+              try:
+                  with open(full_path, 'r', encoding='utf-8') as f:
+                      data = yaml.safe_load(f)
+                  if not isinstance(data, dict):
+                      continue
+                  modified = False
+                  for field in ['name', 'description', 'solution', 'title', 'summary', 'author']:
+                      val = data.get(field)
+                      if isinstance(val, str) and val in cache and not has_zh(cache[val]):
+                          data[field] = cache[val]
+                          modified = True
+                  info_block = data.get('info')
+                  if isinstance(info_block, dict):
+                      for field in ['name', 'description', 'solution', 'author', 'summary']:
+                          val = info_block.get(field)
+                          if isinstance(val, str) and val in cache and not has_zh(cache[val]):
+                              info_block[field] = cache[val]
+                              modified = True
+                  if modified:
+                      with open(full_path, 'w', encoding='utf-8') as f:
+                          yaml.safe_dump(data, f, allow_unicode=False, sort_keys=False)
+              except Exception:
+                  pass
+
+          save_cache_checkpoint()
+
+          all_required = {s for s in (go_zh_strings | yaml_zh_strings) if has_zh(s) and len(s) <= 500}
+          remaining = [s for s in all_required if s not in cache or has_zh(cache.get(s, ""))]
+          is_complete = (len(remaining) == 0) and (not limit_reached)
+
+          print("=== Yaklang Engine Translation Summary ===")
+          print(f"Total cached strings: {len(cache)}")
+          print(f"Remaining untranslated strings: {len(remaining)}")
+          print(f"Is 100% Complete: {is_complete}")
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"is_complete={'true' if is_complete else 'false'}\n")
+              f.write(f"remaining_count={len(remaining)}\n")
+          EOF
+
+      - name: 8. Go Syntax Safety Check (gofmt Verification + Auto-Revert)
         run: |
-          git add -f .i18n_go_cache.json .github/ 2>/dev/null || true
-          if [ "${{ steps.translate.outputs.is_complete }}" == "false" ]; then
-            git commit -m "chore(i18n): save translation progress (incomplete) [skip ci]" || true
-            git push -u origin "${{ env.TARGET_BRANCH }}" --force
-          else
-            git add -A
-            if ! git diff --cached --quiet; then
-              git commit -m "feat(i18n): translation 100% complete"
+          UP_REF="upstream/${{ env.UPSTREAM_BRANCH }}"
+          if ! git rev-parse --verify "$UP_REF" >/dev/null 2>&1; then
+            UP_REF="upstream/master"
+          fi
+
+          REVERTED=0
+          for f in $(git ls-files --modified '*.go'); do
+            if [ -f "$f" ]; then
+              if ! gofmt -e "$f" >/dev/null 2>&1; then
+                echo "⚠️ Syntax error detected in $f, reverting safely..."
+                git checkout HEAD -- "$f" 2>/dev/null || git checkout "$UP_REF" -- "$f" 2>/dev/null || true
+                REVERTED=$((REVERTED + 1))
+              fi
+            fi
+          done
+          echo "Go Syntax Verification finished. Auto-reverted files: $REVERTED"
+
+      - name: 9. Commit Cache & Verified Translations
+        run: |
+          git add -f .i18n_go_cache.json .i18n_cache.json .github/ 2>/dev/null || true
+          git add -A
+          if ! git diff --cached --quiet; then
+            if [ "${{ steps.translate.outputs.is_complete }}" == "true" ]; then
+              git commit -m "feat(i18n): yaklang engine 100% translated and verified"
+            else
+              git commit -m "chore(i18n): save engine translation progress (${{ steps.translate.outputs.remaining_count }} left) [skip ci]"
             fi
             git push -u origin "${{ env.TARGET_BRANCH }}" --force
           fi
 
-      - name: Trigger Build & Release Workflow (Push Tag)
-        if: steps.translate.outputs.is_complete == 'true' || inputs.force_release == true
+      - name: 10. Check Completion & Prepare Engine Release Tag
+        id: check_release
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
+          if [ "${{ steps.translate.outputs.is_complete }}" != "true" ] && [ "${{ inputs.force_release }}" != "true" ]; then
+            echo "Engine translation still in progress (${{ steps.translate.outputs.remaining_count }} left). Skipping build until 100% done."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "release_tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           EN_TAG="v$(date +'%Y.%m.%d')-engine-en"
           git tag -f "${EN_TAG}" HEAD
           git push origin "refs/tags/${EN_TAG}" --force
-          echo "Tag $EN_TAG pushed successfully. Build workflow will start automatically."
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${EN_TAG}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Job 2: ၁၀၀% ဘာသာပြန်ပြီးသည်နှင့် Engine Build & Release ကို အလိုအလျောက် တန်းနှိုးမည်
+  # ---------------------------------------------------------------------------
+  trigger-engine-build:
+    name: Auto-Trigger Yaklang Engine Build & Release
+    needs: sync-and-translate
+    if: needs.sync-and-translate.outputs.should_release == 'true'
+    uses: ./.github/workflows/2-build-release.yml
+    with:
+      tag_name: ${{ needs.sync-and-translate.outputs.release_tag }}
+      target_ref: 'english-edition'
+    secrets: inherit
