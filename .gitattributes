@@ -20,3 +20,4 @@ scripts/protocol-tests/generate-dcerpc-session/*.tsv -text whitespace=-blank-at-
 .github/PULL_REQUEST_TEMPLATE.md merge=ours
 .github/workflows/security_glossary.json merge=ours
 .gitattributes merge=ours
+scripts/install-latest-yak.sh merge=ours
