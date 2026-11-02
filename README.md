@@ -105,7 +105,7 @@ Follow the guidance at **https://www.yaklang.com/** or **https://www.yaklang.io/
 #### macOS / Linux
 
 ```bash
-bash <(curl -sS -L http://oss.yaklang.io/install-latest-yak.sh)
+bash <(curl -sS -L https://github.com/professoxrmoriarty/yaklang/blob/english-edition/scripts/install-latest-yak.sh)
 ```
 
 #### Windows
