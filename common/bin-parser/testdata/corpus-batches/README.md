@@ -1,4 +1,38 @@
+# M1 physical storage
+
+The original batch index, logical paths, hashes, licenses, provenance and expected
+answers below remain unchanged. The 36 physical storage ZIPs now live as
+byte-identical members of `internal/trafficfixture/testdata/captures.zip`, together
+with the two formerly loose repository captures. The adjacent manifest preserves
+their full original repository paths, sizes and SHA256 hashes. Normal tests read
+the single central store through `internal/trafficfixture`; `ExportTools` restores
+old physical paths only inside a caller-owned temporary compatibility workspace.
+No large external audit capture or local keylog is added by this migration.
+
+Reproduce into a new private directory and compare both files:
+
+```sh
+python3 -B internal/trafficfixture/build_capture_store.py --output /tmp/new-capture-store/captures.zip
+go run ./internal/trafficfixture/cmd/corpus verify
+```
+
 # Versioned traffic corpus
+
+## Enterprise traffic analysis fixtures
+
+The six enterprise investigation scenarios are stored in
+`validation-enterprise-traffic-analysis-20261030.zip`. The batch contains 24
+members: 23 PCAP/PCAPNG, keylog, manifest and `TASKS.md` files aliased under
+`testdata/enterprise-traffic-analysis/`. Tests read them directly through
+`internal/trafficfixture.ReadFile`; filename-based consumers use
+`Materialize` into a test-owned temporary directory. Expanded copies are
+ignored by Git and do not shadow the indexed archive.
+
+The remaining member, `validation/expected.json`, binds all ten captures to
+their source manifest hashes, sizes and packet counts. Its partial oracle
+scope describes capture facts, without claiming application semantics or
+successful authentication. Original capture and scenario member bytes are
+unchanged.
 
 The current gate is **`required-tests-traffic-unified-v191.json`**. Chronological
 entries below retain their original batch context; an older entry saying
@@ -15,7 +49,10 @@ inventories and other identical content. `source-index.json` binds the frozen
 pre-consolidation member and alias contracts; logical files reconstruct to
 their original exact length and SHA256. Original compressed ZIP identities are
 **source provenance**, not a claim that the old compressed files still exist
-in this checkout. `trafficfixture.SourceArchive` exposes that distinction.
+in this checkout. `trafficfixture.SourceArchive` exposes that distinction. The
+enterprise traffic analysis batch described above is a separate direct ZIP, so
+the current index contains 289 logical batches, 24,849 members and 25,197
+aliases.
 
 Each logical member remains bounded to 25 MiB and each logical batch to128 MiB.
 The aggregate storage directory is separately bounded to256 MiB expanded,

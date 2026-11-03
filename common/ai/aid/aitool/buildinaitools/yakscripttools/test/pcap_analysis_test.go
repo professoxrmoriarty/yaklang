@@ -22,6 +22,7 @@ import (
 	"github.com/yaklang/yaklang/common/consts"
 	"github.com/yaklang/yaklang/common/pcapx/pcapdb"
 	"github.com/yaklang/yaklang/common/schema"
+	"github.com/yaklang/yaklang/internal/trafficfixture"
 )
 
 // Keep the oracle independent of the parser: one TCP conversation, a request
@@ -96,16 +97,18 @@ func TestPCAPAnalysisTools(t *testing.T) {
 	consts.ResetYakitHomeOnce()
 	profile, err := gorm.Open("sqlite3", filepath.Join(home, "profile.sqlite"))
 	require.NoError(t, err)
+	projectPath := filepath.Join(home, "project.sqlite")
+	project, err := consts.CreateProjectDatabase(projectPath)
+	require.NoError(t, err)
 	require.NoError(t, pcapdb.ClosePCAPDatabases())
 	consts.BindProfileDatabase(profile, filepath.Join(home, "profile.sqlite"))
-	// Bind both globals explicitly: lazy project initialization would otherwise
-	// open default-yakit.db inside the fixture and leak its handle on Windows.
-	consts.BindProjectDatabaseWithReader(profile, nil, filepath.Join(home, "profile.sqlite"))
+	consts.BindProjectDatabaseWithReader(project, nil, projectPath)
 	t.Cleanup(func() {
 		require.NoError(t, pcapdb.ClosePCAPDatabases())
 		consts.BindProfileDatabase(previous, previousPath)
 		consts.BindProjectDatabaseWithReader(previousProject.Database, previousProject.ReadDatabase, previousProject.Path)
-		profile.Close()
+		require.NoError(t, profile.Close())
+		require.NoError(t, project.Close())
 		consts.ResetYakitHomeOnce()
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -157,7 +160,7 @@ func TestPCAPAnalysisTools(t *testing.T) {
 	}
 	capture := pcapAnalysisCapture(t, "skill.example")
 	// The live-model harness consumes the exact same bytes and known answers.
-	liveFixture, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "..", "aismoking", "live", "testdata", "pcap_analysis.pcap"))
+	liveFixture, err := trafficfixture.ReadFile(filepath.Join("..", "..", "..", "..", "..", "aismoking", "live", "testdata", "pcap_analysis.pcap"))
 	require.NoError(t, err)
 	require.Equal(t, capture, liveFixture)
 	path := filepath.Join(home, "proof.pcap")
@@ -204,6 +207,43 @@ func TestPCAPAnalysisTools(t *testing.T) {
 		count, err := pcapdb.CountPCAPDatabases()
 		require.NoError(t, err)
 		require.EqualValues(t, 1, count)
+	})
+	t.Run("mac_endpoint_summaries", func(t *testing.T) {
+		macs := query("macs", map[string]any{"limit": 10}).(*pcapdb.ResultPage[pcapdb.MACSummary])
+		require.Nil(t, macs.Error)
+		require.Len(t, macs.Items, 1)
+		require.Equal(t, "01:02:03:04:05:06", macs.Items[0].SourceMAC)
+		require.EqualValues(t, 2, macs.Items[0].SourceIPCount)
+		require.EqualValues(t, 8, macs.Items[0].PacketCount)
+
+		bindings := query("endpoint_bindings", map[string]any{
+			"source_mac": "01:02:03:04:05:06",
+			"limit":      10,
+		}).(*pcapdb.ResultPage[pcapdb.EndpointBindingSummary])
+		require.Nil(t, bindings.Error)
+		require.Len(t, bindings.Items, 2)
+		require.Equal(t, "01:02:03:04:05:06", bindings.Items[0].SourceMAC)
+		require.EqualValues(t, 8, bindings.Items[0].PacketCount+bindings.Items[1].PacketCount)
+	})
+	t.Run("metadata_capture_overview", func(t *testing.T) {
+		meta := object(query("metadata", nil))
+		require.EqualValues(t, 8, meta["packet_count"])
+		require.EqualValues(t, 2, meta["protocol_message_count"])
+		require.EqualValues(t, 1, meta["protocol_kind_count"])
+		require.Equal(t, false, meta["summary_truncated"])
+		protocols := meta["protocols"].([]any)
+		require.Len(t, protocols, 1)
+		protocol := protocols[0].(map[string]any)
+		require.Equal(t, "http", protocol["protocol"])
+		require.EqualValues(t, 2, protocol["count"])
+		statuses := meta["statuses"].([]any)
+		require.Len(t, statuses, 1)
+		require.Equal(t, "decoded", statuses[0].(map[string]any)["status"])
+		transports := meta["transports"].([]any)
+		require.Len(t, transports, 1)
+		require.Equal(t, "tcp", transports[0].(map[string]any)["transport"])
+		require.NotNil(t, meta["first_timestamp_ns"])
+		require.NotNil(t, meta["last_timestamp_ns"])
 	})
 	var messageID uint
 	t.Run("protocol_pagination_and_fields", func(t *testing.T) {
