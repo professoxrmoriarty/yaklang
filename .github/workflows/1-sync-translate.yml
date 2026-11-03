@@ -1,4 +1,4 @@
-name: "1. Smart Diff Sync & Progressive Override (Yaklang Core)"
+name: "1. Smart Diff Sync & Progressive Override"
 
 on:
   schedule:
@@ -7,185 +7,14 @@ on:
     inputs:
       force_release:
         description: '၁၀၀% မပြီးသေးလည်း Release အတင်းထုတ်မည်လား? (true/false)'
+        type: string
         required: false
         default: 'false'
 
-permissions:
-  contents: write
-  actions: write
-
-env:
-  UPSTREAM_REPO: "https://github.com/yaklang/yaklang.git"
-  UPSTREAM_BRANCH: "master"
-  TARGET_BRANCH: "english-edition"
-
 jobs:
-  sync-and-translate:
-    name: "Sync & Progressive Override Yaklang"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
-
-      - name: "2. Sync Upstream Diffs"
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          mkdir -p /tmp/backup/workflows
-          cp -r .github/workflows/* /tmp/backup/workflows/ 2>/dev/null || true
-          [ -f ".github/security_glossary.json" ] && cp .github/security_glossary.json /tmp/backup/
-          [ -f ".i18n_cache.json" ] && cp .i18n_cache.json /tmp/backup/
-
-          git remote add upstream "${{ env.UPSTREAM_REPO }}" 2>/dev/null || git remote set-url upstream "${{ env.UPSTREAM_REPO }}"
-          git fetch upstream "${{ env.UPSTREAM_BRANCH }}" --tags
-          UP_REF="upstream/${{ env.UPSTREAM_BRANCH }}"
-          git checkout -B "${{ env.TARGET_BRANCH }}" "origin/${{ env.TARGET_BRANCH }}" 2>/dev/null || git checkout -B "${{ env.TARGET_BRANCH }}" "$UP_REF"
-
-          if ! git merge "$UP_REF" -X theirs --allow-unrelated-histories --no-edit; then
-            git status --porcelain | awk '$1=="DU" || $1=="UD" {print $2}' | xargs -r git rm -f
-            git checkout --theirs . || true
-            git add -A; git commit --no-edit || true
-          fi
-
-          rm -rf .github/workflows/*; mkdir -p .github/workflows
-          cp -r /tmp/backup/workflows/* .github/workflows/ 2>/dev/null || true
-          [ -f "/tmp/backup/security_glossary.json" ] && cp /tmp/backup/security_glossary.json .github/
-          [ -f "/tmp/backup/.i18n_cache.json" ] && cp /tmp/backup/.i18n_cache.json .
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.23.x'
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - run: python3 -m pip install --upgrade pip deep-translator PyYAML
-
-      - name: "3. Progressive Override (Go, Yak, Markdown, YAML)"
-        id: translate
-        run: |
-          python3 - << 'EOF'
-          import os, re, json, time, yaml
-          from deep_translator import GoogleTranslator
-          CACHE_FILE = ".i18n_cache.json"
-          translator = GoogleTranslator(source='zh-CN', target='en')
-          zh_char_re = re.compile(r'[\u4e00-\u9fff]')
-          def has_zh(text): return bool(zh_char_re.search(str(text)))
-
-          cache = {}
-          if os.path.exists(CACHE_FILE):
-              try:
-                  with open(CACHE_FILE, 'r', encoding='utf-8') as f: cache = json.loads(f.read())
-              except: pass
-
-          TOKEN_RE = re.compile(r'(//[^\n]*|/\*[\s\S]*?\*/|#[^\n]*)|(`[^`]*`)|("(?:\\.|[^"\\\n])*")|(\'(?:\\.|[^\'\\\n])*\')')
-          source_files = []
-          zh_strings = set()
-          IGNORE_DIRS = {".git", ".github", "vendor", "testdata", "dist"}
-
-          for root, dirs, files in os.walk("."):
-              dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
-              for file in files:
-                  if file.endswith('_test.go'): continue
-                  p = os.path.join(root, file)
-                  if file.endswith(('.go', '.yak', '.md', '.yml', '.yaml', '.sf')):
-                      try:
-                          with open(p, 'r', encoding='utf-8') as f: c = f.read()
-                          if not has_zh(c): continue
-                          source_files.append(p)
-                          if p.endswith('.md'):
-                              for ln in c.splitlines():
-                                  if has_zh(ln) and not ln.strip().startswith("```") and len(ln) <= 500: zh_strings.add(ln.strip())
-                          else:
-                              is_go = p.endswith('.go')
-                              for m in TOKEN_RE.finditer(c):
-                                  comment, raw_s, dq_s, sq_s = m.groups()
-                                  if comment or raw_s: continue
-                                  tok = dq_s or (sq_s if not is_go else None)
-                                  if tok and has_zh(tok):
-                                      inner = tok[1:-1]
-                                      if len(inner) <= 500: zh_strings.add(inner)
-                      except: pass
-
-          uncached = [s for s in zh_strings if s not in cache or has_zh(cache.get(s, ""))]
-          print(f"Total Strings: {len(zh_strings)} | Uncached: {len(uncached)}")
-
-          start_time = time.time()
-          limit_reached = False
-          for idx, s in enumerate(uncached):
-              if time.time() - start_time > 45 * 60: limit_reached = True; break
-              try:
-                  res = translator.translate(s)
-                  if res and not has_zh(res): cache[s] = res
-              except: time.sleep(1.5)
-              if (idx + 1) % 30 == 0: 
-                  with open(CACHE_FILE, 'w', encoding='utf-8') as f: json.dump(cache, f, ensure_ascii=False, indent=2)
-                  time.sleep(0.4)
-
-          with open(CACHE_FILE, 'w', encoding='utf-8') as f: json.dump(cache, f, ensure_ascii=False, indent=2)
-
-          # ACTIVE OVERRIDE: Replace in source files immediately
-          for p in source_files:
-              try:
-                  with open(p, 'r', encoding='utf-8') as f: c = f.read()
-                  if p.endswith('.md'):
-                      out = []
-                      for ln in c.splitlines():
-                          st = ln.strip()
-                          out.append(ln.replace(st, cache[st], 1) if st in cache and not has_zh(cache[st]) else ln)
-                      nc = "\n".join(out) + "\n"
-                  else:
-                      is_go = p.endswith('.go')
-                      def repl(m):
-                          comment, raw_s, dq_s, sq_s = m.groups()
-                          if comment or raw_s: return m.group(0)
-                          tok = dq_s or (sq_s if not is_go else None)
-                          if tok and has_zh(tok):
-                              q, inner = tok[0], tok[1:-1]
-                              if inner in cache and not has_zh(cache[inner]):
-                                  tr = cache[inner].replace('\r', ' ').replace('\n', '\\n')
-                                  tr = re.sub(r'(?<!\\)"', r'\"', tr) if q == '"' else re.sub(r"(?<!\\)'", r"\'", tr)
-                                  return f"{q}{tr}{q}"
-                          return m.group(0)
-                      nc = TOKEN_RE.sub(repl, c)
-                  if nc != c:
-                      with open(p, 'w', encoding='utf-8') as f: f.write(nc)
-              except: pass
-
-          remaining = [s for s in zh_strings if s not in cache or has_zh(cache.get(s, ""))]
-          is_complete = (len(remaining) == 0) and not limit_reached
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"is_complete={'true' if is_complete else 'false'}\n")
-              f.write(f"remaining_count={len(remaining)}\n")
-          EOF
-
-      - name: "4. Syntax Check & Auto-Revert (Go)"
-        run: |
-          for f in $(git ls-files --modified '*.go'); do
-            if [ -f "$f" ] && ! gofmt -e "$f" >/dev/null 2>&1; then
-              git checkout HEAD -- "$f" 2>/dev/null || true
-            fi
-          done
-
-      - name: "5. Commit Source Code Progress & Trigger Release"
-        env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
-        run: |
-          git add -A
-          if ! git diff --cached --quiet; then
-            if [ "${{ steps.translate.outputs.is_complete }}" == "true" ]; then
-              git commit -m "feat(i18n): 100% translated source files to English"
-            else
-              git commit -m "chore(i18n): progressive source code override (${{ steps.translate.outputs.remaining_count }} left) [skip ci]"
-            fi
-            git push origin HEAD:refs/heads/${{ env.TARGET_BRANCH }} --force
-          fi
-
-          if [ "${{ steps.translate.outputs.is_complete }}" == "true" ] || [ "${{ inputs.force_release }}" == "true" ]; then
-            VERSION="$(tr -d '[:space:]' < VERSION 2>/dev/null || echo '1.3.1')"
-            EN_TAG="v${VERSION}-yaklang-en"
-            git tag -f "${EN_TAG}" HEAD
-            git push origin "refs/tags/${EN_TAG}" --force
-            gh workflow run 2-build-release.yml --ref "${{ env.TARGET_BRANCH }}" -f tag_name="${EN_TAG}" || true
-          fi
+  call-central-workflow:
+    # professoxrmoriarty/.github မှ ဗဟို Workflow ကို လှမ်းခေါ်မည်
+    uses: professoxrmoriarty/.github/.github/workflows/central-sync-translate.yml@main
+    with:
+      force_release: ${{ inputs.force_release || 'false' }}
+    secrets: inherit
