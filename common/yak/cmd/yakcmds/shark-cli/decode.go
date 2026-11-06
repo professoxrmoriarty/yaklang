@@ -20,28 +20,29 @@ import (
 )
 
 type packetSummary struct {
-	TransportView        *packetTransportView    `json:"transport_view,omitempty"`
-	PhysicalSource       string                  `json:"physical_source,omitempty"`
-	PhysicalDestination  string                  `json:"physical_destination,omitempty"`
-	TCPFlowID            uint64                  `json:"tcp_flow_id,omitempty"`
-	TCPFlowDomain        *pcaputil.CaptureDomain `json:"tcp_flow_domain,omitempty"`
-	TCPFlowState         string                  `json:"tcp_flow_state,omitempty"`
-	MessageSource        string                  `json:"message_source,omitempty"`
-	MessageDestination   string                  `json:"message_destination,omitempty"`
-	MessageTransport     string                  `json:"message_transport,omitempty"`
-	MessageDomain        *pcaputil.CaptureDomain `json:"message_domain,omitempty"`
-	CaptureDomain        pcaputil.CaptureDomain  `json:"capture_domain"`
-	PDUs                 []map[string]any        `json:"pdus,omitempty"`
-	PublishedPDUs        []map[string]any        `json:"published_pdus,omitempty"`
-	PublishedPDUScope    string                  `json:"published_pdu_scope,omitempty"`
-	PDUObservationScope  string                  `json:"pdu_scope,omitempty"`
-	ProtocolStack        []string                `json:"protocol_stack,omitempty"`
-	ConnectionProtocol   string                  `json:"connection_protocol,omitempty"`
-	ConnectionStack      []string                `json:"connection_stack,omitempty"`
-	ConnectionEvidence   string                  `json:"connection_evidence,omitempty"`
-	ConnectionDiagnostic string                  `json:"connection_diagnostic,omitempty"`
-	Visibility           string                  `json:"visibility,omitempty"`
-	ProtocolStatus       string                  `json:"protocol_status,omitempty"`
+	FieldValues          *pcaputil.DisplayFieldSnapshot `json:"field_values,omitempty"`
+	TransportView        *packetTransportView           `json:"transport_view,omitempty"`
+	PhysicalSource       string                         `json:"physical_source,omitempty"`
+	PhysicalDestination  string                         `json:"physical_destination,omitempty"`
+	TCPFlowID            uint64                         `json:"tcp_flow_id,omitempty"`
+	TCPFlowDomain        *pcaputil.CaptureDomain        `json:"tcp_flow_domain,omitempty"`
+	TCPFlowState         string                         `json:"tcp_flow_state,omitempty"`
+	MessageSource        string                         `json:"message_source,omitempty"`
+	MessageDestination   string                         `json:"message_destination,omitempty"`
+	MessageTransport     string                         `json:"message_transport,omitempty"`
+	MessageDomain        *pcaputil.CaptureDomain        `json:"message_domain,omitempty"`
+	CaptureDomain        pcaputil.CaptureDomain         `json:"capture_domain"`
+	PDUs                 []map[string]any               `json:"pdus,omitempty"`
+	PublishedPDUs        []map[string]any               `json:"published_pdus,omitempty"`
+	PublishedPDUScope    string                         `json:"published_pdu_scope,omitempty"`
+	PDUObservationScope  string                         `json:"pdu_scope,omitempty"`
+	ProtocolStack        []string                       `json:"protocol_stack,omitempty"`
+	ConnectionProtocol   string                         `json:"connection_protocol,omitempty"`
+	ConnectionStack      []string                       `json:"connection_stack,omitempty"`
+	ConnectionEvidence   string                         `json:"connection_evidence,omitempty"`
+	ConnectionDiagnostic string                         `json:"connection_diagnostic,omitempty"`
+	Visibility           string                         `json:"visibility,omitempty"`
+	ProtocolStatus       string                         `json:"protocol_status,omitempty"`
 	packetProtocol       string
 	packetInfo           string
 	connectionAnnotated  bool
@@ -225,10 +226,12 @@ func summarize(raw *capturedPacket) packetSummary {
 		row = applyCapturedNetworkEndpoints(row, &presentation, p, raw.data, presentationNetworkHeaders(presentation, raw.protocolEvents()))
 	}
 	row = presentation.apply(row)
-	row.ConnectionStack = append([]string(nil), raw.connectionStack...)
-	row.ConversationID = raw.conversationID
-	if row.Transport == "udp" && len(row.ConnectionStack) > 0 && row.ConversationID != 0 {
-		row.ConnectionProtocol, row.ConnectionEvidence = row.ConnectionStack[0], "protocol session association"
+	if !presentation.networkRefused {
+		row.ConnectionStack = append([]string(nil), raw.connectionStack...)
+		row.ConversationID = raw.conversationID
+		if row.Transport == "udp" && len(row.ConnectionStack) > 0 && row.ConversationID != 0 {
+			row.ConnectionProtocol, row.ConnectionEvidence = row.ConnectionStack[0], "protocol session association"
+		}
 	}
 	if p.ErrorLayer() != nil {
 		covered := presentation.networkRefused
@@ -258,12 +261,15 @@ func summarize(raw *capturedPacket) packetSummary {
 		row.Info += fmt.Sprintf(" [truncated capture: %d/%d bytes]", len(raw.data), raw.ci.Length)
 		row.ProtocolStatus = "incomplete"
 	}
-	if raw.connectionDiagnostic != "" && len(payload) > 0 && presentation.protocol == "" {
+	if raw.connectionDiagnostic != "" && len(payload) > 0 && (presentation.protocol == "" || presentation.scope == "authenticated TLS record diagnostic" && presentation.status == "malformed") {
 		row.ConnectionDiagnostic = raw.connectionDiagnostic
 		row.Info += " [" + raw.connectionDiagnostic + "]"
 		if row.ProtocolStatus == "" {
 			row.ProtocolStatus = "context-required"
 		}
+	}
+	if presentation.networkRefused {
+		return row // A rejected parent cannot inherit a cached child application.
 	}
 	return applyApplication(row, raw.application, raw.evidence, raw.streamID)
 }
@@ -348,6 +354,11 @@ type packetDetail struct {
 // A generic stateless dissector may expose speculative fragment/child layers
 // after an invalid header. Those are not admitted protocol observations.
 func protocolDetailEvents(events []*pcaputil.ProtocolEvent) ([]*pcaputil.ProtocolEvent, bool) {
+	for _, event := range events {
+		if _, ok := event.NativePPPoEHeaderObservation(); ok {
+			return []*pcaputil.ProtocolEvent{pppoeHeaderDisplayEvent(event)}, true
+		}
+	}
 	for _, event := range events {
 		if presentEvents([]*pcaputil.ProtocolEvent{event}).networkRefused {
 			return []*pcaputil.ProtocolEvent{event}, true
@@ -443,6 +454,7 @@ func detail(raw *capturedPacket) (d packetDetail) {
 		return d // Invalid TCP cannot enter legacy YAML or a partial option formatter.
 	}
 	events, networkRefused := protocolDetailEvents(raw.protocolEvents())
+	d.protocol = inspectionProtocol(raw, events, row.Protocol)
 	d.unavailable = protocolDetailsUnavailable(events)
 	if networkRefused {
 		appendCapturedNetworkPrefix(&d, raw, events)
@@ -470,12 +482,21 @@ func detail(raw *capturedPacket) (d packetDetail) {
 		fields, sources := protocolEventDetail(events, !raw.workerFieldProjection)
 		d.fields = append(d.fields, fields...)
 		d.sources = sources
-		if d.protocol == "" {
+		if caption := wcfTLSObservationCaption(events); caption != "" {
+			d.protocol = caption
+		} else if d.protocol == "" {
 			d.protocol = presentEvents(events).protocol
 		}
 	}
 	if networkRefused || espIncomplete || mldObserved || igmpObserved || pimObserved || ospfObserved || gtpv2Observed || rsvpObserved || icmpv6Partial || icmpv4Partial {
 		return d
+	}
+	if hasCapturedZeroLengthIPv4(raw, row.TransportView) {
+		// A zero declared envelope cannot select a YAML child length. The
+		// compatibility view keeps native PDUs and literal, qualified headers.
+		qualified := quickDetail(raw)
+		qualified.unavailable = d.unavailable
+		return qualified
 	}
 	appendTransportObservation(&d, row)
 	rule := ""
@@ -520,7 +541,8 @@ func detail(raw *capturedPacket) (d packetDetail) {
 			if resultErr == nil && value != nil {
 				wireStart := len(d.fields)
 				flattenFields(value, 0, &d.fields)
-				if summarize(raw).ProtocolScope == "connection-associated bytes" {
+				wireScope := summarize(raw).ProtocolScope
+				if wireScope == "connection-associated bytes" {
 					for i := wireStart; i < len(d.fields); i++ {
 						if d.fields[i].branch && applicationNodes[d.fields[i].text] != "" {
 							// Bytes inside an established stream are not a fresh PDU.
@@ -534,6 +556,10 @@ func detail(raw *capturedPacket) (d packetDetail) {
 				if d.protocol == "TLS?" || !hasObservedTLS(raw) {
 					for i := range d.fields {
 						if d.fields[i].branch && (d.fields[i].text == "TLS" || d.fields[i].text == "Transport Layer Security") {
+							if wireScope == "rejected TLS ServerHello" || wireScope == "rejected TLS ClientHello" || wireScope == "rejected TLS HelloRetryRequest" {
+								d.fields[i].text = "TLS record envelope · see rejected " + strings.TrimPrefix(wireScope, "rejected TLS ") + " PDU; negotiation not established"
+								continue
+							}
 							label := "TLS?"
 							if d.protocol == "TLS" {
 								label = "TLS"
@@ -631,7 +657,7 @@ func flatFields(n *base.NodeValue, section, path string, out *[]field, initialDe
 			*out = append(*out, f)
 		}
 		if n.IsValue() {
-			value := formatFieldValue(n.Name, n.Value)
+			value := formatNodeFieldValue(n)
 			if address, ok := legacyAddressFieldValue(section, n.Name, n.Value); ok {
 				value = address
 			}
@@ -728,6 +754,7 @@ func quickDetail(raw *capturedPacket) packetDetail {
 		return d
 	}
 	events, networkRefused := protocolDetailEvents(raw.protocolEvents())
+	d.protocol = inspectionProtocol(raw, events, row.Protocol)
 	d.unavailable = protocolDetailsUnavailable(events)
 	if networkRefused {
 		appendCapturedNetworkPrefix(&d, raw, events)
@@ -768,6 +795,9 @@ func quickDetail(raw *capturedPacket) packetDetail {
 		offset += len(l.LayerContents())
 		if l.LayerType() == gopacket.LayerTypePayload {
 			d.fields = append(d.fields, field{text: "Payload: " + formatFieldValue("Payload", l.LayerContents()), start: start, end: offset, hasRange: offset > start && offset <= len(raw.data)})
+			continue
+		}
+		if ip, ok := l.(*layers.IPv4); ok && appendZeroLengthIPv4Fields(&d, raw.data, ip, start) {
 			continue
 		}
 		d.fields = append(d.fields, field{text: l.LayerType().String(), branch: true, start: start, end: offset, hasRange: offset > start && offset <= len(raw.data)})

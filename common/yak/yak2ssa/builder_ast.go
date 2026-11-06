@@ -6,7 +6,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/samber/lo"
 	"github.com/yaklang/yaklang/common/utils"
-	"github.com/yaklang/yaklang/common/utils/memedit"
 
 	"github.com/yaklang/antlr/v4"
 	yak "github.com/yaklang/yaklang/common/yak/antlr4yak/parser"
@@ -36,9 +35,12 @@ func (b *astbuilder) build(raw ssa.FrontAST) {
 
 	prog := b.GetProgram()
 	root := prog.GetApplication()
-	var currentEditor *memedit.MemEditor
-	if root != nil {
-		currentEditor = root.GetCurrentEditor()
+	// Includes build on their own program while the application's editor
+	// stack still belongs to the caller. Deduplicate and record the source
+	// this builder actually consumes, independently of file completion order.
+	currentEditor := b.GetEditor()
+	if currentEditor == nil && prog != nil {
+		currentEditor = prog.GetCurrentEditor()
 	}
 	if currentEditor != nil && root != nil {
 		hasFile := func(p *ssa.Program) bool {
@@ -49,7 +51,10 @@ func (b *astbuilder) build(raw ssa.FrontAST) {
 			}
 			return false
 		}
-		if hasFile(root) {
+		// A source already consumed in the application's main scope is not
+		// necessarily built in an include's own scope. The include loader owns
+		// its subprogram cache; skipping that body would publish an empty module.
+		if prog == root && hasFile(root) {
 			return
 		}
 	}
@@ -1246,7 +1251,10 @@ func (b *astbuilder) buildExpression(stmt *yak.ExpressionContext) ssa.Value {
 
 	// function call
 	if s, ok := stmt.FunctionCall().(*yak.FunctionCallContext); ok {
-		return b.EmitCall(b.buildFunctionCallWarp(stmt, s))
+		if c := b.buildFunctionCallWarp(stmt, s); c != nil {
+			return b.EmitCall(c)
+		}
+		return nil
 	}
 
 	// paren expression
@@ -1375,10 +1383,27 @@ func (b *astbuilder) buildExpression(stmt *yak.ExpressionContext) ssa.Value {
 	}
 
 	// | expression '<-' expression
-	// TODO: handler "<-"
 	if stmt.ChanIn() != nil {
-		// op1, op2 := getValue(0), getValue(1)
-		// b.EmitUpdate(op1, op2)
+		op1, op2 := getValue(0), getValue(1)
+		if op1 == nil || op2 == nil {
+			b.NewError(ssa.Error, TAG, "chan send need two expression")
+			return nil
+		}
+		// Only the AOT compiler binds __yak_chan_send (it installs the helper as
+		// an extern value). Static analysis and the interpreter have no binding:
+		// ReadValue would invent a free-value or undefined placeholder for the
+		// name, and calling that reports an undefined value (which fails the
+		// built-in script check). Look the binding up directly and leave the
+		// send unlowered when it is absent.
+		target := b.TryBuildExternValue("__yak_chan_send")
+		if target == nil {
+			return nil
+		}
+		if und, ok := ssa.ToUndefined(target); ok && und != nil {
+			return nil
+		}
+		c := b.NewCall(target, []ssa.Value{op1, op2})
+		return b.EmitCall(c)
 	}
 
 	// | expression 'not'? 'in' expression
@@ -1739,6 +1764,9 @@ func (b *astbuilder) buildFunctionParamDecl(stmt *yak.FunctionParamDeclContext) 
 
 func (b *astbuilder) buildFunctionCallWarp(exprstmt *yak.ExpressionContext, stmt *yak.FunctionCallContext) *ssa.Call {
 	if expr, ok := exprstmt.Expression(0).(*yak.ExpressionContext); ok {
+		if b.tryBuildConstantEval(expr, stmt) {
+			return nil
+		}
 		v := b.buildExpression(expr)
 		if v != nil {
 			return b.buildFunctionCall(stmt, v)

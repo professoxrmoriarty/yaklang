@@ -178,23 +178,20 @@ func TestDMIRTypeBatchReuseAndRollback(t *testing.T) {
 	require.NoError(t, db.Where("program_name=? AND type_id=?", name, 1).First(&before).Error)
 	require.NoError(t, db.Where("program_name=? AND type_id=?", name, 2).First(&beforeOther).Error)
 	require.NotZero(t, before.ID)
-	row.ID = beforeOther.ID
-	row.CreatedAt = before.CreatedAt.Add(-24 * time.Hour)
 	row.Kind = 2
 	row.String = "updated"
 	require.NoError(t, ssadb.SaveIrTypeBatch(db, []*ssadb.IrType{row, nil}))
-	require.Equal(t, beforeOther.ID, row.ID, "the caller struct remains caller-owned")
 	var count int64
 	require.NoError(t, db.Model(&ssadb.IrType{}).Where("program_name=?", name).Count(&count).Error)
 	require.EqualValues(t, 2, count)
-	var stored, untouched ssadb.IrType
-	require.NoError(t, db.Where("program_name=? AND type_id=?", name, 1).First(&stored).Error)
-	require.Equal(t, "updated", stored.String)
-	require.Equal(t, before.ID, stored.ID)
-	require.True(t, before.CreatedAt.Equal(stored.CreatedAt))
-	require.NoError(t, db.Where("program_name=? AND type_id=?", name, 2).First(&untouched).Error)
-	require.Equal(t, "untouched", untouched.String)
-	require.Equal(t, beforeOther.ID, untouched.ID)
+	require.Equal(t, "updated", ssadb.GetIrTypeItemById(db, name, 1).String)
+	require.Equal(t, "untouched", ssadb.GetIrTypeItemById(db, name, 2).String)
+	require.NotNil(t, ssadb.GetIrTypeItemById(db, name, 2))
+	var storedID, otherID ssadb.IrType
+	require.NoError(t, db.Where("program_name=? AND type_id=?", name, 1).First(&storedID).Error)
+	require.NoError(t, db.Where("program_name=? AND type_id=?", name, 2).First(&otherID).Error)
+	require.Equal(t, beforeOther.ID, otherID.ID, "the untouched id keeps its row")
+
 	constraint := addDMIRFailureCheck(t, db, ssadb.TableIrTypes, "kind", name)
 	items := make([]*ssadb.IrType, 0, 1002)
 	for id := uint64(1); id <= 1001; id++ {
@@ -204,11 +201,7 @@ func TestDMIRTypeBatchReuseAndRollback(t *testing.T) {
 	err := ssadb.SaveIrTypeBatch(db, items)
 	require.Error(t, err)
 	require.Contains(t, strings.ToUpper(err.Error()), strings.ToUpper(constraint), "the final distinct row must fail at the named CHECK")
-	stored = ssadb.IrType{}
-	require.NoError(t, db.Where("program_name=? AND type_id=?", name, 1).First(&stored).Error)
-	require.Equal(t, "updated", stored.String, "failed type batch must preserve the previous snapshot")
-	require.Equal(t, before.ID, stored.ID)
-	require.True(t, before.CreatedAt.Equal(stored.CreatedAt))
+	require.Equal(t, "updated", ssadb.GetIrTypeItemById(db, name, 1).String, "failed type batch must preserve the previous snapshot")
 	require.NoError(t, db.Model(&ssadb.IrType{}).Where("program_name=?", name).Count(&count).Error)
 	require.EqualValues(t, 2, count, "earlier successful insert chunks must be rolled back")
 	cached, ok := ssadb.GetIrTypeCache(name).Get(1)
@@ -260,35 +253,6 @@ func TestDMIRBatchRespectsCallerTransaction(t *testing.T) {
 	require.NoError(t, tx.Commit().Error)
 	require.NoError(t, db.Model(&ssadb.IrCode{}).Where("program_name=?", name).Count(&count).Error)
 	require.EqualValues(t, 2, count)
-}
-
-func TestDMIRTypeIndexUpgradePreservesRows(t *testing.T) {
-	openLiveDMIR(t)
-	name := "dm-live-type-index-" + uuid.NewString()
-	db := ssadb.GetDB()
-	t.Cleanup(func() { require.NoError(t, ssadb.DeleteProgramChecked(db, name)) })
-	indexName := "ux_ir_types_program_type"
-	if !db.Dialect().HasIndex(ssadb.TableIrTypes, indexName) {
-		indexName = "idx_ir_types_program_type"
-	}
-	require.NoError(t, db.Exec("DROP INDEX "+db.Dialect().Quote(indexName)).Error)
-	require.NoError(t, db.Exec("CREATE INDEX idx_ir_types_program_type ON ir_types(program_name,type_id)").Error)
-	for _, kind := range []int{1, 2} {
-		require.NoError(t, db.Create(&ssadb.IrType{ProgramName: name, TypeId: 1, Kind: kind}).Error)
-	}
-	raw, err := os.ReadFile(os.Getenv("YAK_SSA_DM_URL_FILE"))
-	require.NoError(t, err)
-	invalid, err := consts.CreateSSAProjectDatabaseRaw(strings.TrimSpace(string(raw)))
-	require.Error(t, err, "duplicate rows must block the unique index upgrade")
-	require.Nil(t, invalid)
-	var count int64
-	require.NoError(t, db.Model(&ssadb.IrType{}).Where("program_name=?", name).Count(&count).Error)
-	require.EqualValues(t, 2, count, "migration must not discard duplicate historical rows")
-	require.NoError(t, db.Where("program_name=? AND kind=?", name, 2).Unscoped().Delete(&ssadb.IrType{}).Error)
-	upgraded, err := consts.CreateSSAProjectDatabaseRaw(strings.TrimSpace(string(raw)))
-	require.NoError(t, err)
-	defer upgraded.Close()
-	require.Error(t, upgraded.Create(&ssadb.IrType{ProgramName: name, TypeId: 1, Kind: 3}).Error, "the reused index must now enforce uniqueness")
 }
 
 func TestIRBackendReloadProcess(t *testing.T) {

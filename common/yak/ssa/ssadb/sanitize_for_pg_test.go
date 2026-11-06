@@ -296,8 +296,9 @@ func TestBeforeSaveHookStripsNUL_SaveInBatchesPath(t *testing.T) {
 
 	require.NoError(t, db.AutoMigrate(&IrCode{}, &IrType{}).Error)
 	patchIrCodeIndex(db)
+	require.NoError(t, ensureIrTypeIndexes(db))
 	require.True(t, db.New().Dialect().HasIndex(TableIrCodes, "ux_ir_codes_program_code"))
-	require.True(t, db.New().Dialect().HasIndex(TableIrTypes, "ux_ir_types_program_type"))
+	require.True(t, db.New().Dialect().HasIndex(TableIrTypes, irTypeUniqueIndex))
 
 	require.NoError(t, SaveIrCodeBatch(db, []*IrCode{{ProgramName: "p\x00rog", CodeID: 1, Name: "func\x00x"}}))
 	var code IrCode
@@ -305,7 +306,5 @@ func TestBeforeSaveHookStripsNUL_SaveInBatchesPath(t *testing.T) {
 	assert.Equal(t, "funcx", code.Name)
 
 	require.NoError(t, SaveIrTypeBatch(db, []*IrType{{ProgramName: "prog", TypeId: 1, String: "ty\x00pe"}}))
-	var typ IrType
-	require.NoError(t, db.Where("program_name = ? AND type_id = ?", "prog", 1).First(&typ).Error)
-	assert.Equal(t, "type", typ.String)
+	assert.Equal(t, "type", loadIrType(t, db, "prog", 1).String)
 }

@@ -94,6 +94,14 @@ var builtinBinSpecs = [][2]string{
 	{"application-layer.tds_fields", "TDSResponse71Fields"},
 	{"application-layer.tds_fields", "TDSResponse72Fields"},
 	{"amqp", "AMQP"},
+	{"application-layer.cifs", "CIFSDirectTCP"},
+	{"application-layer.cifs", "CIFSDirectTCPNegotiateExtendedResponse"},
+	{"application-layer.cifs", "CIFSDirectTCPSessionSetupExtendedRequest"},
+	{"application-layer.cifs", "CIFSDirectTCPSessionSetupExtendedResponse"},
+	{"application-layer.cifs", "CIFSDirectTCPTreeConnectAndXRequest"},
+	{"application-layer.cifs", "CIFSDirectTCPTreeConnectAndXResponse"},
+	{"application-layer.cifs", "CIFSDirectTCPDeleteRequest"},
+	{"application-layer.cifs", "CIFSDirectTCPDeleteResponse"},
 	{"application-layer.smb2", "SMB2"},
 	{"application-layer.smb3", "SMB3Transform"},
 	{"application-layer.dcerpc", "DCERPC"},
@@ -748,10 +756,22 @@ func (a *binParser) datagramFields(network gopacket.NetworkLayer, udp *layers.UD
 			a.messages.Add(1)
 			a.messageBytes.Add(uint64(len(wire)))
 			if a.config.Deferred {
-				a.deferred.Add(1)
+				e.normalizeKerberosContext()
+				if e.Status == "context-required" {
+					a.contextRequired.Add(1)
+				} else if e.Status == "malformed" {
+					a.malformed.Add(1)
+				} else {
+					a.deferred.Add(1)
+				}
 			} else if result, err := e.Decode(); err != nil {
 				e.Status, e.Error = "malformed", err.Error()
-				a.malformed.Add(1)
+				e.normalizeKerberosContext()
+				if e.Status == "context-required" {
+					a.contextRequired.Add(1)
+				} else {
+					a.malformed.Add(1)
+				}
 			} else {
 				e.Status, e.Structured = "decoded", result
 				a.decoded.Add(1)
@@ -771,7 +791,14 @@ func (a *binParser) datagramFields(network gopacket.NetworkLayer, udp *layers.UD
 		}
 	}
 	if e.Raw == nil {
-		e.Raw = append([]byte(nil), wire[:min(len(wire), a.config.ProbeBytes)]...)
+		n := min(len(wire), a.config.ProbeBytes)
+		if carrierErr == nil && e.Status == "unrecognized" && len(wire) <= a.config.MaxMessageBytes {
+			// ProbeBytes limits recognition, not the identity of a complete,
+			// bounded UDP payload. Keep its owned bytes for source inspection
+			// without granting an application identity or Decode admission.
+			n, e.Completeness = len(wire), "datagram"
+		}
+		e.Raw = append([]byte(nil), wire[:n]...)
 	}
 	a.emit(e)
 }

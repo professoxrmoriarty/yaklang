@@ -655,6 +655,19 @@ type BasicType struct {
 	description *basicTypeDescription
 
 	fullTypeName orderedTypeNames
+
+	// floatCast marks the target type of a float() cast. It keeps the
+	// "number" name so every user-visible type report (hover, static
+	// analysis, declared types) reads exactly as before; only the ssa2llvm
+	// lowering needs to tell a float() target from an int() one.
+	floatCast bool
+}
+
+// IsFloatCastType reports whether this type is the target of a float() cast.
+// Every other basic type answers false, so a plain number type keeps behaving
+// as an int target.
+func (t *BasicType) IsFloatCastType() bool {
+	return t != nil && t.floatCast
 }
 
 type basicTypeDescription struct{ name string }
@@ -748,6 +761,18 @@ func CreateNumberType() Type {
 	return NewBasicType(NumberTypeKind, "number")
 }
 
+// CreateFloatType is the target type of a float() cast. It shares the
+// NumberTypeKind (so type compatibility and every printed type name are
+// unchanged: float() still reports "number") and is told apart from an int()
+// cast only through IsFloatCastType, which the ssa2llvm compiler uses to pick
+// the conversion direction. A distinct printed name would leak into hover and
+// static-analysis output.
+func CreateFloatType() Type {
+	typ := NewBasicType(NumberTypeKind, "number")
+	typ.floatCast = true
+	return typ
+}
+
 func CreateStringType() Type {
 	return NewBasicType(StringTypeKind, "string")
 }
@@ -803,7 +828,7 @@ func GetTypeByStr(typ string) Type {
 	case "uint", "uint8", "byte", "uint16", "uint32", "uint64", "int", "int8", "int16", "int32", "int64", "uintptr":
 		return CreateNumberType()
 	case "float", "float32", "float64", "double", "complex128", "complex64":
-		return CreateNumberType()
+		return CreateFloatType()
 	case "string":
 		return CreateStringType()
 	case "bool":
@@ -892,6 +917,15 @@ func (a *AliasType) GetTypeKind() TypeKind {
 
 func (a *AliasType) GetType() Type {
 	return a.elem
+}
+
+// Retarget points an alias at the type that was declared after it was used.
+// The alias identity stays put; only its target changes.
+func (a *AliasType) Retarget(elem Type) {
+	if a == nil || elem == nil {
+		return
+	}
+	a.elem = elem
 }
 
 // ====================== interface type
@@ -1419,13 +1453,82 @@ type FunctionType struct {
 var _ Type = (*FunctionType)(nil)
 
 func (f *FunctionType) SetIsMethod(isMethod bool, obj Type) {
+	f.setMethodBinding(isMethod, obj)
+}
+
+// ParameterValueAt returns one parameter object. After a finished function's
+// body is released, ParameterValue is nil and the object is reloaded by id.
+// The reloaded pointer is not stored back onto the type.
+func (f *FunctionType) ParameterValueAt(i int) *Parameter {
+	if f == nil || i < 0 {
+		return nil
+	}
+	if f.ParameterValue != nil {
+		if i < len(f.ParameterValue) {
+			return f.ParameterValue[i]
+		}
+		return nil
+	}
+	if f.This == nil || i >= len(f.This.Params) {
+		return nil
+	}
+	inst, ok := f.This.GetValueById(f.This.Params[i])
+	if !ok || utils.IsNil(inst) {
+		return nil
+	}
+	param, _ := ToParameter(inst)
+	return param
+}
+
+// LiveParameterMembers returns the parameter-member objects. A nil slice means
+// the body was released; the ids on This are loaded and not cached.
+func (f *FunctionType) LiveParameterMembers() []*ParameterMember {
+	if f == nil {
+		return nil
+	}
+	if f.ParameterMember != nil {
+		return f.ParameterMember
+	}
+	if f.This == nil || len(f.This.ParameterMembers) == 0 {
+		return nil
+	}
+	out := make([]*ParameterMember, 0, len(f.This.ParameterMembers))
+	for _, id := range f.This.ParameterMembers {
+		inst, ok := f.This.GetValueById(id)
+		if !ok || utils.IsNil(inst) {
+			continue
+		}
+		if member, ok := ToParameterMember(inst); ok && member != nil {
+			out = append(out, member)
+		}
+	}
+	return out
+}
+
+// setMethodBinding records whether the function is a method and, once, the
+// type that declares it. Lookup resolves one function through every type that
+// embeds or aliases it and reports that lookup type here, so a later caller in
+// a parallel compile would otherwise overwrite the declaring type. A call site
+// learns its own receiver from the member it called, not from this field.
+func (f *FunctionType) setMethodBinding(isMethod bool, obj Type) {
 	if f == nil {
 		return
 	}
 	f.receiverMu.Lock()
+	defer f.receiverMu.Unlock()
 	f.IsMethod = isMethod
-	f.ObjectType = obj
-	f.receiverMu.Unlock()
+	if f.ObjectType == nil {
+		f.ObjectType = obj
+	}
+}
+
+func (f *FunctionType) boundReceiver() Type {
+	if f == nil {
+		return nil
+	}
+	f.receiverMu.RLock()
+	defer f.receiverMu.RUnlock()
+	return f.ObjectType
 }
 
 func (f *FunctionType) AddFullTypeName(name string) {
@@ -1481,6 +1584,23 @@ func (s *FunctionType) resetStringCache() {
 	if s != nil {
 		s.stringCache.Store(nil)
 	}
+}
+
+// ForgetStringCache drops text cached before a nested type was resolved.
+func (s *FunctionType) ForgetStringCache() {
+	s.resetStringCache()
+}
+
+// ReplaceBoundReceiver corrects a receiver that was recorded before its
+// declaration existed. Unlike setMethodBinding, it replaces an existing type.
+func (s *FunctionType) ReplaceBoundReceiver(typ Type) {
+	if s == nil {
+		return
+	}
+	s.receiverMu.Lock()
+	s.ObjectType = typ
+	s.receiverMu.Unlock()
+	s.resetStringCache()
 }
 
 func NewFunctionType(name string, Parameter []Type, ReturnType Type, IsVariadic bool) *FunctionType {

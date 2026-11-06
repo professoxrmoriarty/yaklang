@@ -653,9 +653,8 @@ func (r *ReActLoop) callAIFunctionTransaction(
 		aicommon.WithAIRequest_Context(activeTaskCtx),
 		captureOption,
 	}
-	if compressionMode {
-		requestOpts = append(requestOpts, aicommon.WithAIRequest_ExtraSpecOpts(aispec.WithThinkingLevel("none")))
-	}
+	// Inherit the model's configured thinking level so compression can reuse
+	// the preceding main-model prefix without a forced mode switch.
 
 	postHandler := func(resp *aicommon.AIResponse) error {
 		r.clearCallsExecutionValues(acceptedCalls)
@@ -765,6 +764,10 @@ func (r *ReActLoop) callAIFunctionTransaction(
 				Index: rawCall.Index, Description: rawCall.Description,
 				ArgumentsJSON: rawCall.Function.Arguments,
 			})
+		}
+
+		if compressionMode && len(calls) != 1 {
+			return utils.Errorf("compress_context must be called exactly once in compression mode, got %d calls", len(calls))
 		}
 
 		// Normalize all deltas before action-specific verification. An adjustment
@@ -933,9 +936,8 @@ func (r *ReActLoop) callAINormalTransaction(streamWg *sync.WaitGroup, prompt str
 				})(req)
 		},
 	}
-	if compressionMode {
-		requestOpts = append(requestOpts, aicommon.WithAIRequest_ExtraSpecOpts(aispec.WithThinkingLevel("none")))
-	}
+	// Inherit the model's configured thinking level so compression can reuse
+	// the preceding main-model prefix without a forced mode switch.
 	var acceptedResp *aicommon.AIResponse
 
 	postHandler := func(resp *aicommon.AIResponse) (err error) {

@@ -15,26 +15,8 @@ func ReplaceAllValue(v Value, to Value) {
 	ReplaceValue(v, to, func(i Instruction) bool { return false })
 }
 
-func replaceBlueprintFieldReference(fields map[string][]Value, from Value, to Value) {
-	if len(fields) == 0 {
-		return
-	}
-	for name, values := range fields {
-		if len(values) == 0 {
-			continue
-		}
-		replaced := false
-		for index, current := range values {
-			if utils.IsNil(current) || current.GetId() != from.GetId() {
-				continue
-			}
-			values[index] = to
-			replaced = true
-		}
-		if replaced {
-			fields[name] = values
-		}
-	}
+func replaceBlueprintFieldReference(fields *blueprintMemberMap, from Value, to Value) {
+	fields.replace(from, to)
 }
 
 func replaceProgramBlueprintReference(prog *Program, from Value, to Value) {

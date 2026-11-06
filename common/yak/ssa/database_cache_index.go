@@ -3,8 +3,9 @@ package ssa
 import (
 	"github.com/yaklang/gorm"
 
-	"github.com/yaklang/yaklang/common/utils"
 	"sync"
+
+	"github.com/yaklang/yaklang/common/utils"
 
 	"github.com/yaklang/yaklang/common/utils/dbcache"
 	"github.com/yaklang/yaklang/common/utils/memedit"
@@ -21,11 +22,14 @@ type indexStore struct {
 	program *Program
 	db      *gorm.DB
 
-	variable     *utils.SafeMapWithKey[string, []int64]
-	member       *utils.SafeMapWithKey[string, []int64]
-	class        *utils.SafeMapWithKey[string, []int64]
-	consts       *utils.SafeMapWithKey[string, []int64]
-	residentKeys *utils.SafeMapWithKey[residentIndexKey, struct{}]
+	variable *utils.SafeMapWithKey[string, []int64]
+	member   *utils.SafeMapWithKey[string, []int64]
+	class    *utils.SafeMapWithKey[string, []int64]
+	consts   *utils.SafeMapWithKey[string, []int64]
+	// residentKeys is a plain map guarded by residentMu. It already shares that
+	// lock with every index mutation, so a second locking wrapper only added
+	// overhead — and it made "was this id ever indexed?" a two-step check.
+	residentKeys map[residentIndexKey]struct{}
 	residentMu   sync.Mutex
 	indexSaved   *utils.SafeMapWithKey[indexRelationshipKey, struct{}]
 
@@ -51,7 +55,7 @@ func newIndexStore(cfg *ssaconfig.Config, prog *Program, mode ProgramCacheKind, 
 		member:       utils.NewSafeMapWithKey[string, []int64](),
 		class:        utils.NewSafeMapWithKey[string, []int64](),
 		consts:       utils.NewSafeMapWithKey[string, []int64](),
-		residentKeys: utils.NewSafeMapWithKey[residentIndexKey, struct{}](),
+		residentKeys: make(map[residentIndexKey]struct{}),
 		indexSaved:   utils.NewSafeMapWithKey[indexRelationshipKey, struct{}](),
 		offsetSaved:  utils.NewSafeMapWithKey[offsetLocationKey, struct{}](),
 	}
@@ -60,6 +64,13 @@ func newIndexStore(cfg *ssaconfig.Config, prog *Program, mode ProgramCacheKind, 
 	}
 
 	store.indexSaver = dbcache.NewSave(func(indices []*ssadb.IrIndex) error {
+		// Async index batches can commit before the compile barrier. The name
+		// rows have to land first or the saved variable ids point at nothing.
+		if store.program != nil && store.program.NameCache != nil {
+			if err := store.program.NameCache.Flush(); err != nil {
+				return err
+			}
+		}
 		saveStep := func() error {
 			return utils.GormTransaction(db, func(tx *gorm.DB) error {
 				return ssadb.SaveIrIndexBatch(tx, indices)
@@ -164,13 +175,19 @@ func (s *indexStore) RemoveVariable(name string, inst Instruction) {
 	name, member := normalizeVariableName(name)
 	s.residentMu.Lock()
 	defer s.residentMu.Unlock()
+	index, indexName := s.variable, name
 	if member != "" {
-		removeResidentIndex(s.member, member, inst.GetId())
-		s.residentKeys.Delete(residentIndexKey{s.member, member, inst.GetId()})
+		index, indexName = s.member, member
+	}
+	key := residentIndexKey{index, indexName, inst.GetId()}
+	// An id that was never indexed cannot be in the list, and scanning the list
+	// to remove nothing was the bulk of the allocation while members were being
+	// replaced: every miss still copied the whole slice.
+	if _, exists := s.residentKeys[key]; !exists {
 		return
 	}
-	removeResidentIndex(s.variable, name, inst.GetId())
-	s.residentKeys.Delete(residentIndexKey{s.variable, name, inst.GetId()})
+	delete(s.residentKeys, key)
+	removeResidentIndex(index, indexName, inst.GetId())
 }
 
 func (s *indexStore) AddClassInstance(name string, inst Instruction) {
@@ -184,16 +201,70 @@ func (s *indexStore) AddClassInstance(name string, inst Instruction) {
 }
 
 func (s *indexStore) saveIndexDedup(index *ssadb.IrIndex) {
-	if s != nil && s.indexSaver != nil && index != nil {
-		fresh := false
-		s.indexSaved.Update(indexRelationship(index), func(_ struct{}, exists bool) (struct{}, bool) {
-			fresh = !exists
-			return struct{}{}, true
-		})
-		if fresh {
-			s.indexSaver.Save(index)
-		}
+	if s == nil || s.indexSaver == nil || index == nil {
+		return
 	}
+	fresh := false
+	s.indexSaved.Update(indexRelationship(index), func(_ struct{}, exists bool) (struct{}, bool) {
+		fresh = !exists
+		return struct{}{}, true
+	})
+	if fresh {
+		s.indexSaver.Save(index)
+	}
+}
+
+func (s *indexStore) programLabel() string {
+	if s == nil || s.program == nil {
+		return ""
+	}
+	if app := s.program.GetApplication(); app != nil && app.Name != "" {
+		return app.Name
+	}
+	return s.program.Name
+}
+
+// ReleaseSettled drops the resident name/id membership of a finished batch.
+// Only that membership is redundant: the lookup slices keep the id, and both
+// finders dedupe by id, so forgetting it costs at most a duplicate slice entry.
+//
+// The index and offset dedup keys stay. They are the only record that a
+// relationship reached the saver, and a watermark cannot replace them: it says
+// that some row below an id was written, never that this particular name was.
+// A forgotten key therefore turns a re-registration into a duplicate
+// ir_indices_v1 row (the table has no UNIQUE key) or into a failed
+// ir_offsets UNIQUE insert, and an old id really does gain new names: a Java
+// pre-handler allocates a local first and registers its name while the AST is
+// built, which can land after a mid-batch release.
+func (s *indexStore) ReleaseSettled(programName string) int {
+	if s == nil || programName == "" || programName != s.programLabel() {
+		return 0
+	}
+	s.residentMu.Lock()
+	defer s.residentMu.Unlock()
+	if s.residentKeys == nil {
+		return 0
+	}
+	released := len(s.residentKeys)
+	// Clear drops every entry, not just the finished batch. A key above the
+	// batch is only a guard against appending the same id twice, so losing it
+	// costs one duplicate slice entry. Index rows are still deduped by
+	// indexSaved, and scanning 7M keys per batch to keep the guard is worse.
+	clear(s.residentKeys)
+	return released
+}
+
+// ReleaseSettledIndexes is the batch barrier hook. It releases the resident
+// index membership of everything appended so far; the dedup keys stay.
+func (prog *Program) ReleaseSettledIndexes() int {
+	if batchReleaseDisabledForTest.Load() || prog == nil || prog.Cache == nil || prog.Cache.indexes == nil {
+		return 0
+	}
+	app := prog.GetApplication()
+	if app == nil {
+		app = prog
+	}
+	return prog.Cache.indexes.ReleaseSettled(app.GetProgramName())
 }
 
 // A key owns scalar IDs, never pointers into the GORM row that the saver edits.
@@ -231,23 +302,70 @@ type residentIndexKey struct {
 }
 
 func (s *indexStore) appendIndex(index *utils.SafeMapWithKey[string, []int64], name string, id int64) {
-	if id <= 0 {
+	if s == nil || id <= 0 {
 		return
 	}
 	s.residentMu.Lock()
 	defer s.residentMu.Unlock()
 	// Appending and publishing membership share one lock, including removal.
-	s.residentKeys.Update(residentIndexKey{index, name, id}, func(_ struct{}, exists bool) (struct{}, bool) {
-		if !exists {
-			appendResidentIndex(index, name, id)
-		}
-		return struct{}{}, true
-	})
+	key := residentIndexKey{index, name, id}
+	if _, exists := s.residentKeys[key]; exists {
+		return
+	}
+	s.residentKeys[key] = struct{}{}
+	appendResidentIndex(index, name, id)
 }
 
 // checkValue is a pure exact/glob/regexp predicate. Key filtering can run under
 // an index read lock, but resolve (which may populate indexes) always runs after
 // the matching snapshot has released that lock.
+// FindByVariableName resolves one exact variable, member, or class name.
+// Exact rules used to scan every index key. Hue's struct scan calls that
+// path once per rule while the index grows to hundreds of thousands of names.
+func (s *indexStore) FindByVariableName(mod ssadb.MatchMode, name string, resolve func(id int64) Instruction) []Instruction {
+	if s == nil || resolve == nil || name == "" {
+		return nil
+	}
+	var ins []Instruction
+	seen := make(map[int64]struct{})
+	resolveOnce := func(id int64) Instruction {
+		if id <= 0 {
+			return nil
+		}
+		if _, exists := seen[id]; exists {
+			return nil
+		}
+		seen[id] = struct{}{}
+		return resolve(id)
+	}
+	appendIDs := func(ids []int64) {
+		copied := append([]int64(nil), ids...)
+		for _, id := range copied {
+			if inst := resolveOnce(id); inst != nil {
+				ins = append(ins, inst)
+			}
+		}
+	}
+	if mod&ssadb.KeyMatch != 0 && s.member != nil {
+		if ids, ok := s.member.Get(name); ok {
+			appendIDs(ids)
+		}
+	}
+	if mod&ssadb.NameMatch != 0 {
+		if s.variable != nil {
+			if ids, ok := s.variable.Get(name); ok {
+				appendIDs(ids)
+			}
+		}
+		if s.class != nil {
+			if ids, ok := s.class.Get(name); ok {
+				appendIDs(ids)
+			}
+		}
+	}
+	return ins
+}
+
 func (s *indexStore) FindByVariableEx(mod ssadb.MatchMode, checkValue func(string) bool, resolve func(id int64) Instruction) []Instruction {
 	if s == nil || resolve == nil {
 		return nil
@@ -339,7 +457,7 @@ func (s *indexStore) SaveVariableOffset(variable *Variable, rng *memedit.Range) 
 // file editor multiple times. Different ranges for the same value_id are
 // legitimate and are NOT deduped.
 func (s *indexStore) saveOffsetDedup(offset *ssadb.IrOffset) {
-	if offset == nil {
+	if s == nil || offset == nil {
 		return
 	}
 	if s.program != nil && s.program.NameCache != nil {
@@ -382,13 +500,29 @@ func appendResidentIndex(index *utils.SafeMapWithKey[string, []int64], key strin
 }
 
 func removeResidentIndex(index *utils.SafeMapWithKey[string, []int64], key string, id int64) {
-	if index == nil || id <= 0 || !index.Have(key) {
+	if index == nil || id <= 0 {
 		return
 	}
-	index.Update(key, func(data []int64, _ bool) ([]int64, bool) {
+	index.Update(key, func(data []int64, loaded bool) ([]int64, bool) {
 		// Readers can retain the previous slice after releasing the map lock.
-		// Removal must not shift elements in that shared backing array.
-		var result []int64
+		// A real removal therefore publishes a new backing array. A miss keeps
+		// the existing slice: copying it would only create allocation traffic.
+		if !loaded || len(data) == 0 {
+			return data, false
+		}
+		matches := 0
+		for _, item := range data {
+			if item == id {
+				matches++
+			}
+		}
+		if matches == 0 {
+			return data, false
+		}
+		if matches == len(data) {
+			return nil, true
+		}
+		result := make([]int64, 0, len(data)-matches)
 		for _, item := range data {
 			if item != id {
 				result = append(result, item)

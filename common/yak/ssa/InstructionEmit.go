@@ -241,6 +241,35 @@ func (f *FunctionBuilder) emitEx(i Instruction, insert func(Instruction)) {
 	f.GetProgram().SetVirtualRegister(i)
 	insert(i)
 	fixupUseChain(i) // this function should after set Program
+	f.maybeFlushEmitted()
+}
+
+// maybeFlushEmitted writes the saver queues of a large function before they
+// hold every offset row. Batch 105 of the yaklang self-scan reached 23GiB
+// in use while one batch was still building; 4GiB of that was offset rows
+// and their dedup keys waiting for the batch barrier.
+func (f *FunctionBuilder) maybeFlushEmitted() {
+	const emitFlushEvery = 8192
+	if f == nil || f.flushingEmits {
+		return
+	}
+	f.emitSinceFlush++
+	if f.emitSinceFlush < emitFlushEvery {
+		return
+	}
+	f.emitSinceFlush = 0
+	f.flushingEmits = true
+	defer func() { f.flushingEmits = false }()
+	prog := f.GetProgram()
+	if prog == nil || prog.Cache == nil || !prog.Cache.HaveDatabaseBackend() {
+		return
+	}
+	prog.Cache.FlushInstructionSaver()
+	if prog.Cache.indexes != nil && prog.Cache.indexes.offsetSaver != nil {
+		_ = prog.Cache.indexes.offsetSaver.Flush()
+	}
+	prog.ReleaseSettledIndexes()
+	releasePersistedOffsetValues(prog)
 }
 
 // EmitUndefined emit undefined value
@@ -312,13 +341,10 @@ func noteCapturedByClosure(v Value, name string) {
 		return
 	}
 	fn := v.GetFunc()
-	if fn == nil || fn.builder == nil {
+	if fn == nil || fn.builder == nil || fn.builder.capturedNames == nil {
 		return
 	}
-	if fn.builder.capturedNames == nil {
-		fn.builder.capturedNames = make(map[string]struct{})
-	}
-	fn.builder.capturedNames[name] = struct{}{}
+	fn.builder.capturedNames.Set(name, struct{}{})
 }
 
 func valueCapturedByClosure(v Value) bool {
@@ -705,6 +731,17 @@ func (f *FunctionBuilder) SetReturnSideEffects() {
 		}
 
 		SideEffectsReturn[variable] = ser
+		variableName := ""
+		if variable != nil {
+			variableName = variable.GetName()
+		}
+		f.SideEffectReturnSites = append(f.SideEffectReturnSites, FunctionSideEffectSite{
+			Name:         ser.Name,
+			VerboseName:  ser.VerboseName,
+			Modify:       ser.Modify,
+			Kind:         ser.Kind,
+			VariableName: variableName,
+		})
 	}
 	f.SideEffects = nil
 	f.SideEffectsReturn = append(f.SideEffectsReturn, SideEffectsReturn)

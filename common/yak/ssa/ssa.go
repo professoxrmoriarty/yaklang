@@ -400,6 +400,11 @@ type Program struct {
 	// Template Language
 	templateMu sync.Mutex
 	Template   map[string]tl.TemplateGeneratedInfo
+	// templateByBase indexes Template by filepath.Base so TryGetTemplate does
+	// not scan every template. templateMiss remembers basename lookups that
+	// are absent or ambiguous until the next SetTemplate.
+	templateByBase map[string][]templateIndexEntry
+	templateMiss   map[string]struct{}
 
 	config *LanguageConfig
 	ctx    context.Context
@@ -440,6 +445,13 @@ type Function struct {
 	// function side effects
 	SideEffects       []*FunctionSideEffect
 	SideEffectsReturn []map[*Variable]*FunctionSideEffect
+	// SideEffectReturnSites is the scope-free copy of SideEffectsReturn.
+	// SetReturnSideEffects appends one entry per recorded side effect, and
+	// Finish releases SideEffectsReturn because its Variable keys retain the
+	// body scope for as long as the function lives. Backends that run after
+	// Finish (the AOT compiler writing captured values back to their slots)
+	// read this list instead of the maps.
+	SideEffectReturnSites []FunctionSideEffectSite
 
 	// throws clause
 	Throws []int64
@@ -482,7 +494,13 @@ type Function struct {
 	//if blueprint method,we need record.
 	currentBlueprint *Blueprint
 
-	finished bool
+	finished           bool
+	bodyScopesDetached bool
+
+	// compileUnitKey is the compile unit that created this function. It is
+	// recorded at creation time so a completed unit can release this function's
+	// body without guessing the unit from a language-specific function name.
+	compileUnitKey string
 }
 
 func (f *Function) SetCurrentReturnType(t Type) {
@@ -712,8 +730,41 @@ type Phi struct {
 	CFGEntryBasicBlock int64
 
 	Edge []int64 // value  // edge[i] from phi.Block.Preds[i]
+	// LoopCarriedEdges lists Edge indexes that mean "unchanged in this
+	// iteration". The loop spin handler folds such an edge to the loop's
+	// pre-loop value so the merge stays a single phi, but the exact iteration
+	// semantics are the phi's own previous value. Consumers that need exact
+	// values (code generation) read the phi itself on those edges instead.
+	LoopCarriedEdges []int64
 	//	what instruction create this control-flow merge?
 	// branch *Instruction // loop or if :
+}
+
+// MarkLoopCarriedEdge records that Edge[index] stands for the phi's previous
+// iteration value, not for the pre-loop value stored in that slot.
+func (p *Phi) MarkLoopCarriedEdge(index int) {
+	if p == nil || index < 0 {
+		return
+	}
+	for _, existing := range p.LoopCarriedEdges {
+		if existing == int64(index) {
+			return
+		}
+	}
+	p.LoopCarriedEdges = append(p.LoopCarriedEdges, int64(index))
+}
+
+// IsLoopCarriedEdge reports whether Edge[index] is a folded "unchanged" edge.
+func (p *Phi) IsLoopCarriedEdge(index int) bool {
+	if p == nil || index < 0 {
+		return false
+	}
+	for _, existing := range p.LoopCarriedEdges {
+		if existing == int64(index) {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Phi) IsPhi() bool {
@@ -1053,7 +1104,7 @@ func (p *Parameter) GetDefault() Value {
 }
 
 func (p *Parameter) SetDefault(v Value) {
-	if p == nil {
+	if p == nil || utils.IsNil(v) {
 		return
 	}
 	defer p.markPersistenceDirty()
@@ -1276,6 +1327,38 @@ var (
 	_ User        = (*Make)(nil)
 	_ Instruction = (*Make)(nil)
 )
+
+// GetParent returns the parent value id for slice expressions (e.g. s[1:3]).
+func (m *Make) GetParent() int64 {
+	if m == nil {
+		return 0
+	}
+	return m.parentI
+}
+
+// GetLow returns the lower-bound value id for slice expressions.
+func (m *Make) GetLow() int64 {
+	if m == nil {
+		return 0
+	}
+	return m.low
+}
+
+// GetHigh returns the upper-bound value id for slice expressions.
+func (m *Make) GetHigh() int64 {
+	if m == nil {
+		return 0
+	}
+	return m.high
+}
+
+// GetStep returns the step value id for slice expressions.
+func (m *Make) GetStep() int64 {
+	if m == nil {
+		return 0
+	}
+	return m.step
+}
 
 // ------------- Next
 type Next struct {

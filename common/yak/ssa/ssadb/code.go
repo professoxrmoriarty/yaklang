@@ -14,10 +14,10 @@ import (
 
 type IrCode struct {
 	gorm.Model
-	CodeID int64 `json:"code_id" gorm:"index:idx_ircode_program_codeid;index"`
+	CodeID int64 `json:"code_id"`
 
-	ProgramName string `json:"program_name" gorm:"index:idx_ircode_program_codeid;index:idx_ircode_program_opcode;index"`
-	Version     string `json:"package_version" gorm:"index"`
+	ProgramName string `json:"program_name"`
+	Version     string `json:"package_version"`
 
 	// source code
 	SourceCodeStartOffset int64  `json:"source_code_start_offset"`
@@ -25,7 +25,7 @@ type IrCode struct {
 	SourceCodeHash        string `json:"source_code_hash"` // default md5
 
 	// opcode
-	Opcode     int64  `json:"opcode" gorm:"index:idx_ircode_program_opcode"`
+	Opcode     int64  `json:"opcode"`
 	OpcodeName string `json:"opcode_name"`
 
 	// just for binary and unary operator
@@ -90,7 +90,7 @@ type IrCode struct {
 	Variable StringSlice `json:"variable" gorm:"type:text"`
 
 	// compile hash means: hash[ (file-content)+(program-name)+(package-name)+(program-index) ]
-	ProgramCompileHash string `json:"program_compile_hash" gorm:"index"`
+	ProgramCompileHash string `json:"program_compile_hash"`
 
 	// type
 	TypeID int64 `json:"type_id"`
@@ -102,7 +102,7 @@ type IrCode struct {
 	// not important information
 	ExtraInformation string `json:"extra_information" gorm:"type:text"`
 
-	ConstType string `json:"const_type" gorm:"index"`
+	ConstType string `json:"const_type"`
 }
 
 func (*IrCode) TableName() string {
@@ -126,7 +126,9 @@ func GetIrCodeItemById(db *gorm.DB, progName string, id int64) *IrCode {
 	// soft-delete semantics, custom scanners). Context timeout/cancel on the
 	// native path does not fall back to GORM (that would re-hang).
 	native, err := nativeGetIrCodeItemByIdErr(db, progName, id)
-	if native != nil {
+	if native != nil || err == nil {
+		// A successful native lookup may be empty. Retrying that normal miss
+		// through GORM doubles SQL traffic during compile-time lazy lookups.
 		return native
 	}
 	if nativeContextErr(err) {
@@ -175,10 +177,47 @@ func SaveIrCodeBatch(db *gorm.DB, items []*IrCode) error {
 	if db == nil || len(items) == 0 {
 		return nil
 	}
-	if err := db.New().SaveInBatches(items, irCodeBatchChunk, "program_name", "code_id").Error; err != nil {
+	// One call keeps the batch in a single transaction, so a rejected row
+	// rolls back the earlier chunks too. PostgreSQL rejects a statement that
+	// names the same conflict key twice, so the batch keeps the last row per
+	// (program_name, code_id) before SaveInBatches splits it.
+	deduped := dedupeIrCodeConflictKeys(items)
+	if len(deduped) == 0 {
+		return nil
+	}
+	if err := db.New().SaveInBatches(deduped, irCodeBatchChunk, "program_name", "code_id").Error; err != nil {
 		return fmt.Errorf("upsert IR snapshot: %w", err)
 	}
+	for program, rows := range irCodeRowsByProgram(deduped) {
+		counter := irCodeWriteCounterFor(program)
+		counter.updateStatements.Add(int64((rows + irCodeBatchChunk - 1) / irCodeBatchChunk))
+		counter.updateRows.Add(int64(rows))
+	}
 	return nil
+}
+
+// dedupeIrCodeConflictKeys keeps the last row for a repeated
+// (program_name, code_id) so one upsert chunk cannot name a conflict key twice.
+func dedupeIrCodeConflictKeys(items []*IrCode) []*IrCode {
+	type conflictKey struct {
+		program string
+		codeID  int64
+	}
+	seen := make(map[conflictKey]int, len(items))
+	out := items[:0]
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		key := conflictKey{program: item.ProgramName, codeID: item.CodeID}
+		if index, ok := seen[key]; ok {
+			out[index] = item
+			continue
+		}
+		seen[key] = len(out)
+		out = append(out, item)
+	}
+	return out
 }
 
 var hash = []string{
@@ -253,11 +292,11 @@ func (r *IrCode) GetStartAndEndPositions() (*memedit.MemEditor, *memedit.Positio
 		return nil, nil, nil, utils.Errorf("GetStartAndEndPositions failed: %v", err)
 	}
 	startOff, endOff := memedit.ClampOffsetPair(editor, int(r.SourceCodeStartOffset), int(r.SourceCodeEndOffset))
-	start, startErr := editor.GetPositionByOffsetWithError(startOff)
+	start, startErr := editor.GetSourceBoundaryPosition(startOff)
 	if startErr != nil {
 		return nil, nil, nil, utils.Errorf("GetStartAndEndPositions start: %v", startErr)
 	}
-	end, endErr := editor.GetPositionByOffsetWithError(endOff)
+	end, endErr := editor.GetSourceBoundaryPosition(endOff)
 	if endErr != nil {
 		return nil, nil, nil, utils.Errorf("GetStartAndEndPositions end: %v", endErr)
 	}

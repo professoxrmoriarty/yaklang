@@ -3,7 +3,6 @@ package ssaapi
 import (
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,6 +12,11 @@ import (
 	"github.com/yaklang/yaklang/common/yak/ssa"
 	"github.com/yaklang/yaklang/common/yak/ssaapi/ssareducer"
 )
+
+// slowPreHandlerFileThreshold is when one file's pre-handler pass is worth
+// reporting. Normal files finish in milliseconds; the ones that stall a batch
+// run for minutes.
+const slowPreHandlerFileThreshold = time.Second
 
 type prehandleBatchEnv struct {
 	c                     *Config
@@ -30,6 +34,11 @@ type prehandleBatchEnv struct {
 	astParseErrLogged     int
 	astParseErrSuppressed bool
 	maxAstParseErrLogs    int
+	// unitAssign sticks one library to one worker. workerLoad counts files
+	// so the next library lands on the least busy worker instead of a hash
+	// bucket. Worker 0 stays reserved for units that share the application.
+	unitAssign map[string]int
+	workerLoad []int
 }
 
 // unitWorkerCounts is the only serial-versus-parallel decision for one batch.
@@ -125,13 +134,27 @@ func (env *prehandleBatchEnv) unitWorker(key string, workers int) int {
 	if workers == 2 {
 		return 1
 	}
-	h := fnv.New32a()
 	ownerKey := owner.Name
 	if ownerKey == "" {
 		ownerKey = key
 	}
-	_, _ = h.Write([]byte(ownerKey))
-	return int(h.Sum32()%uint32(workers-1)) + 1
+	if env.unitAssign == nil {
+		env.unitAssign = make(map[string]int)
+		env.workerLoad = make([]int, workers)
+	}
+	if worker, ok := env.unitAssign[ownerKey]; ok {
+		env.workerLoad[worker]++
+		return worker
+	}
+	best := 1
+	for i := 2; i < workers; i++ {
+		if env.workerLoad[i] < env.workerLoad[best] {
+			best = i
+		}
+	}
+	env.unitAssign[ownerKey] = best
+	env.workerLoad[best]++
+	return best
 }
 
 func (env *prehandleBatchEnv) prehandleFile(fileContent *ssareducer.FileContent) {
@@ -139,6 +162,21 @@ func (env *prehandleBatchEnv) prehandleFile(fileContent *ssareducer.FileContent)
 		return
 	}
 	defer fileContent.Release()
+	// A file that takes minutes in here pins one worker and stalls its whole
+	// batch, and the batch log only prints after the batch ends — so the run
+	// looks hung with no clue which file did it. Report the culprit by name.
+	filePath := fileContent.Path
+	fileStarted := time.Now()
+	defer func() {
+		if elapsed := time.Since(fileStarted); elapsed > slowPreHandlerFileThreshold {
+			log.Warnf("[ssa-compile] slow pre-handler file %s took %v", filePath, elapsed)
+		}
+	}()
+	// Progress counts finished files: the heavy work (pre-handler + inline file build) is
+	// below, and a file picked up by a worker must not advance the bar before it is done.
+	if env.preHandlerProcess != nil {
+		defer env.preHandlerProcess()
+	}
 	unitKey := env.fileUnits[fileContent.Path]
 	owner := env.prog.EnsureLibraryForCompileUnit(unitKey)
 	if owner == nil {
@@ -178,6 +216,10 @@ func (env *prehandleBatchEnv) prehandleFile(fileContent *ssareducer.FileContent)
 		env.astErr = utils.Errorf("parse Ast file: %s error: %s", fileContent.Path, fileContent.Err)
 		env.astErrMu.Unlock()
 	}
+	if env.c.GetCompileAstOnly() {
+		ssa.ReleaseASTRoot(fileContent.AST)
+		return
+	}
 	editor := env.prog.CreateEditor(fileContent.Content, fileContent.Path)
 	fileContent.Editor = editor
 	fileContent.Content = nil
@@ -187,7 +229,6 @@ func (env *prehandleBatchEnv) prehandleFile(fileContent *ssareducer.FileContent)
 		env.astErr = utils.JoinErrors(env.astErr, utils.Errorf("pre-handler parse file %s error: %v", fileContent.Path, fileContent.Err))
 		env.astErrMu.Unlock()
 	}
-	env.preHandlerProcess()
 	unitBuilder := env.prog.GetOrCreateUnitBuilder(unitKey, env.builder)
 	if unitBuilder == nil {
 		unitBuilder = env.builder
@@ -237,6 +278,11 @@ func (env *prehandleBatchEnv) prehandleFile(fileContent *ssareducer.FileContent)
 				}
 			})
 		case !needsCompile && fileContent.Editor != nil:
+			if env.c.hasYakEntryFiles() {
+				// CreateEditor already retained this source. An unexecuted
+				// include target must not enter the compiled FileList.
+				break
+			}
 			rootEditor := fileContent.Editor
 			owner.RegisterDeferredBuild(ssa.DeferredBuildKindHelper, "extra-file:"+rootEditor.GetUrl(), func() {
 				owner.PushEditor(rootEditor)

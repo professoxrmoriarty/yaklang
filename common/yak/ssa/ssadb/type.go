@@ -1,26 +1,30 @@
 package ssadb
 
 import (
+	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/yaklang/gorm"
-
-	"github.com/yaklang/yaklang/common/utils"
 )
 
-// irTypeBatchChunk bounds rows per SaveInBatches chunk under SQLite's
-// MAX_VARIABLE_NUMBER=250000 ceiling; 1000 rows is safe for the wide IrType
-// model and reduces the number of multi-row INSERT statements per flush.
+// irTypeBatchChunk bounds rows per SaveInBatches chunk.
 const irTypeBatchChunk = 1000
 
+// IrType stores one type body per type id.
+//
+// A program holds one row per distinct type content: typeStore interns equal
+// types before it allocates an id, so duplicate ids never reach this table.
+// That is what removed the id-to-payload indirection of the previous schema
+// without keeping a mapping table.
 type IrType struct {
 	gorm.Model
-	TypeId           uint64 `json:"type_id" gorm:"index"`
+	TypeId           uint64 `json:"type_id" gorm:"not null"`
 	Kind             int    `json:"kind"`
-	ProgramName      string `json:"program_name"`
+	ProgramName      string `json:"program_name" gorm:"not null"`
 	String           string `json:"string" gorm:"type:text"`
 	ExtraInformation string `json:"extra_information" gorm:"type:text"`
-	// Hash             string `json:"hash" gorm:"unique_index"`
 }
 
 func (*IrType) TableName() string {
@@ -35,31 +39,11 @@ func (t *IrType) GetIdInt64() int64 {
 	return int64(t.TypeId)
 }
 
-func (t *IrType) CalcHash(ex ...string) string {
-	return utils.CalcSha1(t.ProgramName, t.Kind, t.String, t.ExtraInformation, ex)
-}
-
-func (ir *IrType) Save(db *gorm.DB) error {
-	return db.Save(ir).Error
-}
-
-func UpsertIrType(db *gorm.DB, ir *IrType) error {
-	if db == nil || ir == nil {
-		return nil
+func EmptyIrType(progName string, id uint64) *IrType {
+	return &IrType{
+		ProgramName: progName,
+		TypeId:      id,
 	}
-	record := &IrType{
-		ProgramName: ir.ProgramName,
-		TypeId:      ir.TypeId,
-	}
-	if err := db.Where("program_name = ? AND type_id = ?", ir.ProgramName, ir.TypeId).
-		Assign(ir).
-		FirstOrCreate(record).Error; err != nil {
-		return err
-	}
-	if cache := GetIrTypeCache(ir.ProgramName); cache != nil {
-		cache.Set(int64(ir.TypeId), ir)
-	}
-	return nil
 }
 
 // SaveIrTypeBatch writes types as in-place upserts on (program_name, type_id).
@@ -76,7 +60,7 @@ func SaveIrTypeBatch(db *gorm.DB, items []*IrType) error {
 	if err := db.New().SaveInBatches(items, irTypeBatchChunk, "program_name", "type_id").Error; err != nil {
 		return fmt.Errorf("upsert IR type: %w", err)
 	}
-	// keep the in-process type cache warm (same side effect as UpsertIrType)
+	// keep the in-process type cache warm
 	for _, it := range items {
 		if it == nil {
 			continue
@@ -88,52 +72,37 @@ func SaveIrTypeBatch(db *gorm.DB, items []*IrType) error {
 	return nil
 }
 
-func EmptyIrType(progName string, id uint64) *IrType {
-	return &IrType{
-		ProgramName: progName,
-		TypeId:      id,
-	}
-}
-
+// GetIrTypeItemById returns one stored type body, or nil when the id is absent.
 func GetIrTypeItemById(db *gorm.DB, progName string, id int64) *IrType {
-	if id < 0 {
+	if db == nil || id < 0 {
 		return nil
 	}
-	// Native-SQL fast path (see GetIrCodeItemById comment). Same result as the
-	// GORM First() path; falls back to GORM on any native error.
-	native, err := nativeGetIrTypeItemByIdErr(db, progName, id)
-	if native != nil {
-		return native
-	}
-	if nativeContextErr(err) {
+	// Bind through database/sql. GORM's Raw query on a handle that already
+	// carries model scopes rewrites FROM into "FROM <model>, <query>", which is
+	// a syntax error; that turned every type read into nil and once cost ARTEX
+	// 97 reflected-XSS risks.
+	ctx, cancel := nativeQueryContext(context.Background())
+	defer cancel()
+	query := bindSQLPlaceholdersDB(db,
+		`SELECT kind, "string", extra_information FROM "`+TableIrTypes+`"`+
+			` WHERE program_name = ? AND type_id = ? AND deleted_at IS NULL`)
+	var kind int
+	var text, extra string
+	err := nativeQueryRowContext(db, ctx, query, progName, id).Scan(&kind, &text, &extra)
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
-	// check cache
-	ir := &IrType{}
-	// db = db.Debug()
-	if db := db.Model(&IrType{}).
-		Where("type_id = ?", id).
-		Where("program_name = ?", progName).
-		First(ir); db.Error != nil {
+	if err != nil {
+		// A real read error must not be reported as a missing type; the caller
+		// would cache a nil and emit a different IR for this id.
+		log.Warnf("read IR type %s/%d: %v", progName, id, err)
 		return nil
 	}
-	return ir
-}
-
-func DeleteIrType(db *gorm.DB, id []int64) error {
-	// log.Errorf("DeleteIrType: %d", len(id))
-	if len(id) == 0 {
-		return utils.Errorf("delete type from database id is empty")
+	return &IrType{
+		TypeId:           uint64(id),
+		ProgramName:      progName,
+		Kind:             kind,
+		String:           text,
+		ExtraInformation: extra,
 	}
-	return utils.GormTransaction(db, func(tx *gorm.DB) error {
-		// split each 999
-		for i := 0; i < len(id); i += 999 {
-			end := i + 999
-			if end > len(id) {
-				end = len(id)
-			}
-			tx.Where("id IN (?)", id[i:end]).Unscoped().Delete(&IrType{})
-		}
-		return nil
-	})
 }

@@ -142,7 +142,12 @@ func NewCache[T MemoryItem, D any](
 ) *Cache[T, D] {
 	cfg := NewConfig(opt...)
 	ctx, cancel := context.WithCancel(cfg.ctx)
-	skipEviction, _ := cfg.skipEviction.(func(T) bool)
+	// The option closed over the caller's element type, so the erased callback
+	// is adapted back to T here, once, instead of on every eviction check.
+	var skipEviction func(T) bool
+	if eraser := cfg.skipEviction; eraser != nil {
+		skipEviction = func(value T) bool { return eraser(value) }
+	}
 
 	cache := &Cache[T, D]{
 		cancel:           cancel,
@@ -215,14 +220,26 @@ func NewCache[T MemoryItem, D any](
 			}, nil
 		})
 
-		cache.saver = NewSave(func(tasks []*saveTask[D]) error {
-			return cache.handleSaveBatch(tasks, save)
-		},
+		// Save stores *saveTask[D], so the caller's size function has to
+		// measure task.data. Dropping it here makes the row-count limit the
+		// only batch boundary.
+		saveOpts := []Option{
 			WithContext(ctx),
 			WithSaveSize(cfg.saveSize),
 			WithSaveTimeout(cfg.saveTimeout),
 			WithName(cfg.name),
-		)
+		}
+		if sizeOf := cfg.saveByteSize; sizeOf != nil && cfg.saveByteBudget > 0 {
+			saveOpts = append(saveOpts, WithSaveByteBudget(cfg.saveByteBudget, func(task *saveTask[D]) int {
+				if task == nil {
+					return 1
+				}
+				return sizeOf(task.data)
+			}))
+		}
+		cache.saver = NewSave(func(tasks []*saveTask[D]) error {
+			return cache.handleSaveBatch(tasks, save)
+		}, saveOpts...)
 
 		cache.wg.Add(1)
 		go func() {
@@ -279,6 +296,14 @@ func (c *Cache[T, D]) GetResident(id int64) (T, bool) {
 		return *new(T), false
 	}
 	return c.resident.GetResident(id)
+}
+
+// PeekResident reads the resident value without cancelling a queued flush.
+func (c *Cache[T, D]) PeekResident(id int64) (T, bool) {
+	if c == nil || c.resident == nil {
+		return *new(T), false
+	}
+	return c.resident.PeekResident(id)
 }
 
 func (c *Cache[T, D]) Delete(id int64) {

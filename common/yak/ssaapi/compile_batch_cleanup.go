@@ -25,6 +25,22 @@ type compileBatchCleanup struct {
 	reportProgress func(float64, string, ...any)
 }
 
+// releaseBuiltBodies spills finished function bodies while the pipeline
+// is between waves. The batch barrier still runs the full cleanup.
+func (task compileBatchCleanup) releaseBuiltBodies() {
+	if task.incremental || task.program == nil || task.program.Cache == nil {
+		return
+	}
+	task.program.DetachFinishedFunctionBodyScopes()
+	task.program.Cache.FlushCompileUnit("scc")
+	task.program.Cache.FlushInstructionSaver()
+	task.program.ReleasePersistedOrdinaryValues()
+	task.program.Cache.FlushAuxSavers()
+	task.program.Cache.FlushInstructionSaver()
+	task.program.ReleasePersistedOrdinaryValues()
+	task.program.ReleaseSettledIndexes()
+}
+
 func (task compileBatchCleanup) run() error {
 	if task.structScan {
 		index := &structResidentOpcodeIndex{prog: task.program}
@@ -47,15 +63,52 @@ func (task compileBatchCleanup) run() error {
 	// The cache owns database selection. A batch may hand off persistence only
 	// after its unit bodies have finished building.
 	if task.program.Cache != nil {
+		// One barrier line per batch. Without it a slow scan cannot be
+		// attributed between building, spilling, auxiliary stores and
+		// release: the per-batch wall clock alone does not say which step
+		// held the compile thread.
+		var barrierStart = time.Now()
+		stepStart := barrierStart
+		step := func() time.Duration {
+			d := time.Since(stepStart)
+			stepStart = time.Now()
+			return d
+		}
+		// Nil finished body scopes before the flush evicts their blocks.
+		// Otherwise the block leaves the resident map while Parameter.block
+		// still owns the scope, and the version maps stay until the process ends.
+		task.program.DetachFinishedFunctionBodyScopes()
 		if !task.incremental {
 			task.program.Cache.FlushCompileUnit(strings.Join(task.unitKeys, ","))
 		}
+		flushUnit := step()
 		task.program.Cache.FlushInstructionSaver()
+		flushInst := step()
+		// Unlink ordinary scope values as soon as the instruction saver has
+		// settled, before FlushAuxSavers can trigger another round of evictions.
+		// FlushCompileUnit also evicts finished private BasicBlocks; waiting
+		// until after FlushAuxSavers meant those blocks were already gone from
+		// the resident map, so their scopes were never visited and stayed
+		// reachable through Function.builder.CurrentBlock.
+		task.program.ReleasePersistedOrdinaryValues()
 		task.program.Cache.FlushAuxSavers()
 		// Type/index serialization can reload instructions and enqueue their
-		// eviction again; settle those writes before declaring the batch done.
+		// eviction again; settle those writes before the final scope pass.
+		flushAux := step()
 		task.program.Cache.FlushInstructionSaver()
+		flushInst2 := step()
+		task.program.ReleasePersistedOrdinaryValues()
+		releaseOrdinary := step()
+		task.program.ReleaseSettledIndexes()
+		releaseIndex := step()
 		task.program.CheckMemoryPressure(task.batchIndex+1, task.batchCount)
+		memPressure := step()
+		if stats := task.program.Cache.InstructionCacheStats(); true {
+			log.Infof("[compile-barrier] batch=%d/%d units=%d flush_unit=%s flush_inst=%s flush_aux=%s flush_inst2=%s release_ordinary=%s release_index=%s mem_pressure=%s total=%s resident=%d saver{%s}",
+				task.batchIndex+1, task.batchCount, len(task.batch.units),
+				flushUnit, flushInst, flushAux, flushInst2, releaseOrdinary, releaseIndex, memPressure,
+				time.Since(barrierStart), stats.ResidentCount, stats.Saver)
+		}
 	}
 	if compileUnitLogEnabled() {
 		task.program.ProcessInfof("compile unit batch(%d/%d) build finished units=%s cost=%v",

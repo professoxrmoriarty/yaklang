@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	javaclassparser "github.com/yaklang/javajive/classparser"
+	"github.com/yaklang/yaklang/common/consts"
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/utils/filesys"
 	"github.com/yaklang/yaklang/common/utils/filesys/filesys_interface"
@@ -234,6 +235,9 @@ func (c *Config) parseProject() (progs Programs, err error) {
 	defer debugCleanup()
 
 	programName := c.GetProgramName()
+	// A memory-mode compile owns no database row, so it must not look one up,
+	// delete one, or open the database just to clean up after a failure.
+	memoryOnly := c.GetCompileMemory()
 	// Routing mode: the incremental paths diff against a filesystem, so a
 	// config without one degrades to a full compile regardless of the flags.
 	mode := c.compileMode()
@@ -248,6 +252,9 @@ func (c *Config) parseProject() (progs Programs, err error) {
 	if mode == compileModeIncrementalDiff {
 		programNameToDelete = c.GetLatestProgramName()
 	}
+	// Non-unique IR indexes are rebuilt once, after the inserts, instead of
+	// being maintained row by row. The captured DDL is what gets replayed.
+	var suspendedIndexes []string
 	defer func() {
 		c.Cleanup()
 
@@ -255,14 +262,28 @@ func (c *Config) parseProject() (progs Programs, err error) {
 			err = utils.Errorf("compile panic: %v", r)
 			log.Errorf("compile panic: %v", r)
 			utils.PrintCurrentGoroutineRuntimeStack()
-			if programNameToDelete != "" {
+			if !memoryOnly && programNameToDelete != "" {
 				log.Infof("cleaning up program data due to panic: %s", programNameToDelete)
 				ssadb.DeleteProgram(ssadb.GetDB(), programNameToDelete)
 			}
 		} else if err != nil {
-			if programNameToDelete != "" {
+			if !memoryOnly && programNameToDelete != "" {
 				log.Infof("cleaning up program data due to error: %s", programNameToDelete)
 				ssadb.DeleteProgram(ssadb.GetDB(), programNameToDelete)
+			}
+		}
+		// Rebuild after a failed compile's cleanup so a shared database is not
+		// left without the indexes other programs are queried through.
+		if restoreErr := ssadb.RestoreSecondaryIndexes(ssadb.GetDB(), suspendedIndexes); restoreErr != nil {
+			log.Errorf("restore secondary indexes: %v", restoreErr)
+			if err == nil {
+				err = restoreErr
+			}
+		}
+		if checkpointErr := ssadb.CheckpointSQLiteWAL(ssadb.GetDB()); checkpointErr != nil {
+			log.Errorf("checkpoint sqlite wal: %v", checkpointErr)
+			if err == nil {
+				err = checkpointErr
 			}
 		}
 	}()
@@ -273,10 +294,21 @@ func (c *Config) parseProject() (progs Programs, err error) {
 		if c.GetCompileReCompile() {
 			c.Processf(0, "recompile incremental project, keep base program...")
 		}
-	} else if err := c.cleanupProgramBeforeCompile(programName, c.GetCompileReCompile()); err != nil {
-		return nil, err
+	} else if !memoryOnly {
+		if err := c.cleanupProgramBeforeCompile(programName, c.GetCompileReCompile()); err != nil {
+			return nil, err
+		}
 	}
 
+	var suspendErr error
+	// Raise the SQLite page cache before the bulk inserts. The size-based tuner
+	// below only sees the file as it is now, which is near zero for a fresh
+	// project database that is about to receive millions of IR rows.
+	consts.TuneSQLiteBulkWrite(ssadb.GetDB())
+	suspendedIndexes, suspendErr = ssadb.SuspendSecondaryIndexes(ssadb.GetDB())
+	if suspendErr != nil {
+		log.Warnf("suspend secondary indexes: %v", suspendErr)
+	}
 	c.Processf(0, "recompile project, start compile")
 
 	if mode != compileModeFull {
@@ -934,6 +966,15 @@ func calculateFileSystemDiff(baseFS, newFS fi.FileSystem, exclude ExcludeFunc, p
 // stays in lockstep with the archives the preprocessor actually expands.
 func isRawArchiveDiffEntry(pathname string) bool {
 	return javaclassparser.IsArchiveFile(pathname)
+}
+
+// hideArchiveFiles keeps archive files out of the tree the frontend walks. An
+// archive that is not parsed has no readable source, so leaving it in the walk
+// would only offer the frontend a file it must reject.
+func hideArchiveFiles(fs fi.FileSystem) fi.FileSystem {
+	hook := filesys.NewHookFS(fs)
+	hook.SetSkipMatcher(filesys.CustomMatcher(javaclassparser.IsArchiveFile))
+	return hook
 }
 
 func hasDeleteEntries(fileHashMap map[string]int) bool {

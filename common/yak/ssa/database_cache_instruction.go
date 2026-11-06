@@ -153,7 +153,7 @@ func newInstructionStore(
 			},
 			store.loadInstruction,
 			func(inst Instruction) bool {
-				return shouldKeepInstructionResident(inst) || shouldDelayInstructionEviction(inst)
+				return skipInstructionEviction(inst, store.compileUnitSplit)
 			},
 		)
 		store.reader = reader
@@ -179,6 +179,8 @@ func newInstructionStore(
 
 		cacheTTL, cacheMax := resolveInstructionCacheSettings(cfg)
 		instructionSaveSize, persistLimit := resolveInstructionPersistenceTuning(cfg, saveSize)
+		store.residentReloads = utils.NewCacheExWithKey[int64, Instruction](
+			utils.WithCacheCapacity(largeProjectCacheMax), utils.WithCacheTTL(time.Minute))
 		store.writer = dbcache.NewCache[Instruction, *instructionPersistRecord](
 			cacheTTL,
 			cacheMax,
@@ -188,12 +190,11 @@ func newInstructionStore(
 			dbcache.WithContext(cfg.GetContext()),
 			dbcache.WithSaveSize(instructionSaveSize),
 			dbcache.WithPersistLimit(persistLimit),
+			dbcache.WithSaveByteBudget(largeProjectInstructionByteBudget, instructionRecordBytes),
 			dbcache.WithSaveTimeout(saveTime),
 			dbcache.WithName("Instruction"),
 			dbcache.WithSkipEviction(func(inst Instruction) bool {
-				return shouldKeepInstructionResident(inst) ||
-					(store.compileUnitSplit && shouldKeepCompileUnitBoundaryResident(inst)) ||
-					shouldDelayInstructionEviction(inst)
+				return skipInstructionEviction(inst, store.compileUnitSplit)
 			}),
 		)
 		// Register settlement callback: unreserveID on ALL terminal paths
@@ -264,6 +265,28 @@ func (s *instructionStore) Set(inst Instruction) {
 	}
 }
 
+// residentInstruction returns an instruction only when it is already in
+// memory. A miss must not read the database: reloading a spilled BasicBlock
+// builds a fresh scope and does not recover the compile-time ScopeTable.
+func (s *instructionStore) residentInstruction(id int64) (Instruction, bool) {
+	if s == nil || id <= 0 {
+		return nil, false
+	}
+	switch {
+	case s.writer != nil:
+		inst, ok := s.writer.GetResident(id)
+		return inst, ok && !utils.IsNil(inst)
+	case s.reader != nil:
+		inst, ok := s.reader.GetResident(id)
+		return inst, ok && !utils.IsNil(inst)
+	case s.resident != nil:
+		inst, ok := s.resident.Get(id)
+		return inst, ok && !utils.IsNil(inst)
+	default:
+		return nil, false
+	}
+}
+
 func (s *instructionStore) Get(id int64) Instruction {
 	if s == nil || id <= 0 {
 		return nil
@@ -293,6 +316,25 @@ func (s *instructionStore) Get(id int64) Instruction {
 		}
 	}
 	return nil
+}
+
+func (s *instructionStore) reloadPersistedInstruction(id int64) Instruction {
+	if s == nil || id <= 0 || !s.isPersisted(id) {
+		return nil
+	}
+	if s.residentReloads != nil {
+		if inst, ok := s.residentReloads.Get(id); ok && inst != nil {
+			return inst
+		}
+	}
+	inst, err := s.loadInstruction(id)
+	if err != nil || utils.IsNil(inst) {
+		return nil
+	}
+	if s.residentReloads != nil {
+		s.residentReloads.Set(id, inst)
+	}
+	return inst
 }
 
 func (s *instructionStore) Delete(id int64) {
@@ -442,7 +484,9 @@ func (s *instructionStore) flushCompileUnitWriter(onComplete func()) {
 	ids := make([]int64, 0, 1024)
 	persistedResident := make([]int64, 0)
 	s.writer.ForEach(func(id int64, inst Instruction) bool {
-		if shouldKeepCompileUnitBoundaryResident(inst) && !canSpillFinishedPrivateBlock(inst) {
+		// Body blocks spill only after their scopes were detached. The
+		// flag is set by DetachFinishedFunctionBodyScopes before this flush.
+		if shouldKeepCompileUnitBoundaryResident(inst) && !canSpillFinishedPrivateBlock(inst) && !canSpillFinishedFunctionMember(inst) {
 			return true // continue
 		}
 		// A later unit may reload a persisted instruction. It no longer needs
@@ -841,6 +885,8 @@ func (s *instructionStore) PreloadByIDsFast(ids []int64) {
 		return
 	}
 	ssadb.PreloadIrCodesByIdsFast(ssadb.GetDB(), s.program.Name, ids)
+	// Read mode only reaches this function. Failure leaves per-variable fallback intact.
+	_ = ssadb.PreloadOffsetsByValueIDs(ssadb.GetDB(), applicationProgramName(s.program), ids)
 	cache := ssadb.GetIrCodeCache(s.program.Name)
 	for _, id := range ids {
 		if id <= 0 {
@@ -946,33 +992,50 @@ func (s *instructionStore) acknowledgeCloseFlushIfPersisted(inst Instruction) bo
 	return true
 }
 
+// expandRelationPersistRecords adds relation-only neighbors to the insert set.
+// It must not pull a settled object's whole member graph back through the
+// reverse edge: a new member pointing at an already-saved owner would
+// otherwise re-marshal that owner and every member it has (the Hue review
+// batch amplification), and an insert-only copy would shadow the explicit
+// UPDATE for a dirty owner.
 func (s *instructionStore) expandRelationPersistRecords(records []*instructionPersistRecord) []*instructionPersistRecord {
 	if s == nil || s.program == nil || s.program.Cache == nil || len(records) == 0 {
 		return records
 	}
 	expanded := make([]*instructionPersistRecord, 0, len(records)*2)
-	queued := make(map[int64]struct{}, len(records)*2)
+	queued := make(map[int64]int, len(records)*2)
 	appendRecord := func(record *instructionPersistRecord) {
 		if record == nil || record.IrCode == nil {
 			return
 		}
-		if _, ok := queued[record.CodeID]; ok {
+		if i, ok := queued[record.CodeID]; ok {
+			if record.UpdateExisting && !expanded[i].UpdateExisting {
+				expanded[i] = record
+			}
 			return
 		}
-		queued[record.CodeID] = struct{}{}
+		queued[record.CodeID] = len(expanded)
 		expanded = append(expanded, record)
 	}
-	var walk func(record *instructionPersistRecord)
-	walk = func(record *instructionPersistRecord) {
+	// Register every explicit root before following either relation direction,
+	// so an insert-only neighbor cannot shadow a later root's UPDATE.
+	for _, record := range records {
 		appendRecord(record)
-		if record == nil || record.IrCode == nil {
-			return
-		}
+	}
+	for cursor := 0; cursor < len(expanded); cursor++ {
+		record := expanded[cursor]
 		for _, id := range relationInstructionIDs(record.IrCode) {
 			if _, ok := queued[id]; ok {
 				continue
 			}
-			linked, ok := s.writer.GetResident(id)
+			// Already-saved neighbors are read from their settled row during
+			// reload; walking them here would only rebuild the same graph.
+			if s.isPersisted(id) {
+				continue
+			}
+			// Peek, do not GetResident: a flush already queued this id, and
+			// GetResident would cancel that save so FinishPersist never deletes it.
+			linked, ok := s.writer.PeekResident(id)
 			if !ok || linked == nil {
 				continue
 			}
@@ -989,13 +1052,25 @@ func (s *instructionStore) expandRelationPersistRecords(records []*instructionPe
 				Reason: record.Reason,
 				CodeID: linked.GetId(),
 			}
-			walk(relRecord)
+			appendRecord(relRecord)
 		}
 	}
-	for _, record := range records {
-		walk(record)
-	}
 	return expanded
+}
+
+func instructionRecordBytes(rec *instructionPersistRecord) int {
+	if rec == nil || rec.IrCode == nil {
+		return 1
+	}
+	ir := rec.IrCode
+	n := len(ir.ProgramName) + len(ir.OpcodeName) + len(ir.OpcodeOperator) +
+		len(ir.Name) + len(ir.VerboseName) + len(ir.ShortVerboseName) +
+		len(ir.String) + len(ir.ReadableName) + len(ir.ReadableNameShort) +
+		len(ir.ExtraInformation)
+	if n < 1 {
+		n = 1
+	}
+	return n
 }
 
 func (s *instructionStore) saveInstructionPersistRecords(records []*instructionPersistRecord) error {
@@ -1065,7 +1140,7 @@ func (s *instructionStore) saveInstructionPersistRecords(records []*instructionP
 				if len(insertBatch) < batchSize {
 					batchSize = len(insertBatch)
 				}
-				if err := tx.CreateInBatches(insertBatch, batchSize).Error; err != nil {
+				if err := ssadb.InsertIrCodes(tx, insertBatch, batchSize); err != nil {
 					return err
 				}
 			}

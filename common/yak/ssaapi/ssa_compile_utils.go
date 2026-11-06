@@ -100,7 +100,14 @@ func beginCompileGCPercent(percent int) (int, func()) {
 
 func antlrCacheResetEveryFiles() int {
 	antlrCacheResetEveryFilesOnce.Do(func() {
-		antlrCacheResetEveryFilesCached = 25
+		// Resetting on a fixed file count throws away a DFA the worker just
+		// paid to learn, and the next files rebuild it from scratch. That
+		// dominated allocation on projects below the large-project threshold
+		// (37GB of ATN prediction objects on a 13MB tree). The cache is now
+		// kept for the worker's lifetime and only dropped when it grows past
+		// the byte budget below. YAK_ANTLR_CACHE_RESET_FILES still forces the
+		// old periodic reset.
+		antlrCacheResetEveryFilesCached = 0
 		if raw := strings.TrimSpace(os.Getenv("YAK_ANTLR_CACHE_RESET_FILES")); raw != "" {
 			if v, err := strconv.Atoi(raw); err == nil {
 				antlrCacheResetEveryFilesCached = v
@@ -115,7 +122,10 @@ func antlrCacheResetEveryFiles() int {
 
 func antlrCacheResetEveryBytes() int64 {
 	antlrCacheResetEveryBytesOnce.Do(func() {
-		antlrCacheResetEveryBytesCached = 8 * 1024 * 1024
+		// Upper bound on how much source one worker parses before its DFA and
+		// prediction-context cache are dropped. This caps cache memory without
+		// the periodic rebuild the old 8MB default caused.
+		antlrCacheResetEveryBytesCached = 64 * 1024 * 1024
 		if raw := strings.TrimSpace(os.Getenv("YAK_ANTLR_CACHE_RESET_BYTES")); raw != "" {
 			switch strings.ToLower(raw) {
 			case "0", "false", "no", "off", "disable", "disabled":
@@ -360,11 +370,17 @@ func newAntlrASTParseWorker(c *Config) *antlrASTParseWorker {
 	resetEveryFiles := antlrCacheResetEveryFiles()
 	resetEveryBytes := antlrCacheResetEveryBytes()
 	if c.GetCompileProjectBytes() >= largeProjectByteCap {
+		// A batch used to keep one DFA for every file. Go's prehandler is
+		// serial, so that one worker cache parsed the whole batch and the
+		// DFA reached about 1.4GiB (NewATNConfig) on the yaklang self-scan.
+		// Reset by bytes instead of by file: the DFA stays warm across a
+		// few files, then drops. YAK_ANTLR_CACHE_RESET_FILES / _BYTES still
+		// override this.
 		if _, ok := os.LookupEnv("YAK_ANTLR_CACHE_RESET_FILES"); !ok {
-			resetEveryFiles = 1
+			resetEveryFiles = 0
 		}
 		if _, ok := os.LookupEnv("YAK_ANTLR_CACHE_RESET_BYTES"); !ok {
-			resetEveryBytes = 2 * 1024 * 1024
+			resetEveryBytes = 8 * 1024 * 1024
 		}
 	}
 	return &antlrASTParseWorker{
@@ -447,7 +463,13 @@ func (c *Config) GetFileHandler(
 	parse := func(path string, content []byte, store *utils.SafeMap[any]) (ssa.FrontAST, error) {
 		start := time.Now()
 		defer func() {
-			log.Debugf("pre-handler cost:%v parse ast: %s; size(%s)", time.Since(start), path, formatFileSize(len(content)))
+			elapsed := time.Since(start)
+			if elapsed > slowPreHandlerFileThreshold {
+				// The batch log prints only after every file in it is parsed, so one
+				// pathologically slow parse leaves the run looking hung with no clue.
+				log.Warnf("[ssa-compile] slow ast parse %s took %v size(%s)", path, elapsed, formatFileSize(len(content)))
+			}
+			log.Debugf("pre-handler cost:%v parse ast: %s; size(%s)", elapsed, path, formatFileSize(len(content)))
 		}()
 
 		defer func() {

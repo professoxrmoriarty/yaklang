@@ -7,6 +7,7 @@ import (
 
 	"github.com/yaklang/gorm"
 	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/dbcache"
 	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
 	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
 	"go.uber.org/atomic"
@@ -319,6 +320,9 @@ func (c *ProgramCache) SaveToDatabase(cb ...func(int)) error {
 					persistStats.WriteOperations, persistStats.UniquePersisted, persistStats.Resident,
 					persistStats.Pending, persistStats.WriteOperations, persistStats.BatchCount, avgBatch,
 					persistStats.Resident, persistStats.Pending, persistStats.UnchangedSkipped, persistStats.ResidentReleased)
+				insertRows, updateRows, updateStatements := ssadb.IrCodeWriteBreakdown(progName)
+				log.Infof("[ssa-ir-code-writes] program=%s insert_rows=%d update_rows=%d update_statements=%d",
+					progName, insertRows, updateRows, updateStatements)
 			}
 			return nil
 		},
@@ -428,6 +432,17 @@ func (c *ProgramCache) FlushInstructionSaver() {
 	c.instructions.FlushSaver()
 }
 
+// InstructionCacheStats reports the instruction writer's residency count and
+// async-saver counters (batch count/size, pending depth, save loop time).
+// Read-only telemetry for the compile-batch barrier log; it must not disturb
+// the cache.
+func (c *ProgramCache) InstructionCacheStats() dbcache.CacheStats {
+	if c == nil || c.instructions == nil {
+		return dbcache.CacheStats{}
+	}
+	return c.instructions.Stats()
+}
+
 func (c *ProgramCache) CountReleasedEditors() int {
 	if c == nil {
 		return 0
@@ -451,19 +466,37 @@ func (c *ProgramCache) FlushAuxSavers() {
 	if c == nil || !c.HaveDatabaseBackend() {
 		return
 	}
+	var nameMs, indexMs, typeMs, sourceMs int64
+	// Name ids are referenced by index rows. Persist the batch assigned in
+	// memory before those rows, and never while holding the name-cache lock
+	// across the instruction writer's transaction.
+	if c.program != nil && c.program.NameCache != nil {
+		started := time.Now()
+		if err := c.program.NameCache.Flush(); err != nil {
+			log.Errorf("FlushAuxSavers: name cache flush failed: %v", err)
+		}
+		nameMs = time.Since(started).Milliseconds()
+	}
 	if c.indexes != nil {
+		started := time.Now()
 		if err := c.indexes.Flush(); err != nil {
 			log.Errorf("FlushAuxSavers: index store flush failed: %v", err)
 		}
+		indexMs = time.Since(started).Milliseconds()
 	}
 	if c.types != nil {
+		started := time.Now()
 		if err := c.types.flush(); err != nil {
 			log.Errorf("FlushAuxSavers: type store flush failed: %v", err)
 		}
+		typeMs = time.Since(started).Milliseconds()
 	}
 	if c.sources != nil {
+		started := time.Now()
 		c.sources.FlushAsync()
+		sourceMs = time.Since(started).Milliseconds()
 	}
+	log.Infof("[ssa-flush-aux] names=%dms indexes=%dms types=%dms sources=%dms", nameMs, indexMs, typeMs, sourceMs)
 }
 
 func (c *ProgramCache) CountInstruction() int {
@@ -535,6 +568,13 @@ func (c *ProgramCache) findByVariableEx(mod ssadb.MatchMode, checkValue func(str
 		return nil
 	}
 	return c.indexes.FindByVariableEx(mod, checkValue, c.GetInstruction)
+}
+
+func (c *ProgramCache) findByVariableName(mod ssadb.MatchMode, name string) []Instruction {
+	if c == nil || c.indexes == nil {
+		return nil
+	}
+	return c.indexes.FindByVariableName(mod, name, c.GetInstruction)
 }
 
 // setAtomicMaxIfGreater updates the atomic counter only when the new value is

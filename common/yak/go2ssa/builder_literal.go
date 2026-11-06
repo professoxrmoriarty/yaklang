@@ -588,7 +588,10 @@ func (b *astbuilder) buildFunctionTypeLiteral(stmt *gol.FunctionTypeContext) ssa
 	defer recoverRange()
 
 	if signature := stmt.Signature(); signature != nil {
-		paramt, rett := b.buildSignature(signature.(*gol.SignatureContext))
+		// A function type is only a type. buildSignature would emit Parameter
+		// instructions into whatever function is current, including @main and
+		// every callback parameter of a real function.
+		paramt, rett := b.functionTypeSignature(signature.(*gol.SignatureContext))
 		return ssa.NewFunctionType("", paramt, rett, false)
 	}
 
@@ -737,6 +740,12 @@ func (b *astbuilder) buildFieldDecl(stmt *gol.FieldDeclContext, structTyp *ssa.O
 	var ssatyp ssa.Type = nil
 	if typ := stmt.Type_(); typ != nil {
 		ssatyp = b.buildType(typ.(*gol.Type_Context))
+		// buildType historically resolves *T to T. Preserve the indirection
+		// for named fields, as we already do for embedded fields below: a
+		// pointer's zero value is nil, not a recursively initialized T.
+		if ssatyp != nil && strings.HasPrefix(typ.GetText(), "*") {
+			ssatyp = goPointerType(ssatyp)
+		}
 	}
 
 	if idlist := stmt.IdentifierList(); idlist != nil {
@@ -777,6 +786,13 @@ func (b *astbuilder) buildFieldDecl(stmt *gol.FieldDeclContext, structTyp *ssa.O
 				for _, fn := range fromLib.GetFullTypeNames() {
 					structTyp.AddFullTypeName(fn)
 				}
+			} else if forward, ok := parent.(*forwardNamedType); ok {
+				fieldType := parent
+				if strings.HasPrefix(typ.GetText(), "*") {
+					fieldType = goPointerType(parent)
+				}
+				structTyp.AddField(b.EmitConstInst(name), fieldType)
+				b.noteEmbeddedForward(structTyp, name, forward)
 			} else if notUse, ok := parent.(*ssa.BasicType); ok {
 				// b.NewError(ssa.Warn, TAG, Unreachable())
 				structTyp.AddField(b.EmitConstInst(name), notUse)
@@ -999,9 +1015,20 @@ func (b *astbuilder) getDefaultValue(ityp ssa.Type, depth int, nodes *int, path 
 	case ssa.ObjectTypeKind, ssa.InterfaceTypeKind, ssa.SliceTypeKind, ssa.MapTypeKind:
 		return b.EmitMakeBuildWithType(ityp, nil, nil)
 	case ssa.ClassBluePrintTypeKind:
-		// TODO
-		return b.EmitConstInst(0)
+		return b.unknownDefault(ityp)
 	default:
+		// Any, unresolved and external types are not the number 0. Keep the
+		// type identity and say the value is unknown.
+		return b.unknownDefault(ityp)
+	}
+}
+
+func (b *astbuilder) unknownDefault(typ ssa.Type) ssa.Value {
+	value := b.EmitUndefined("default")
+	if value == nil {
 		return b.EmitConstInst(0)
 	}
+	// Keep the blueprint or any identity. SetType would instantiate a class.
+	value.SetTypeExact(typ)
+	return value
 }

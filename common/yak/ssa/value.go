@@ -7,6 +7,7 @@ import (
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/utils/memedit"
 	"github.com/yaklang/yaklang/common/yak/ssa/ssautil"
+	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
 )
 
 func getAssignExternErrorPos(scope ScopeIF, variable *Variable) *memedit.Range {
@@ -122,9 +123,10 @@ func (b *FunctionBuilder) readValueFromIncludeStack(name string) Value {
 		if !ok {
 			return true
 		}
-		if ret := ReadVariableFromScope(block.ScopeTable, name); ret != nil && ret.Value != nil {
-			value = ret.Value
-			return false
+		if ret := ReadVariableFromScope(block.ScopeTable, name); ret != nil {
+			if value = ret.GetValue(); value != nil {
+				return false
+			}
 		}
 		return true
 	})
@@ -145,7 +147,17 @@ func (b *FunctionBuilder) readValueEx(
 	local := GetFristLocalVariableFromScopeAndParent(scope, name)
 
 	if ret := ReadVariableFromScopeAndParent(scope, name); ret != nil {
-		if local != nil && ret.GetCaptured().GetGlobalIndex() != local.GetCaptured().GetGlobalIndex() {
+		// Yak resolves a name to the newest assignment in the same scope and to
+		// the loop spin phi in a loop condition; the other front ends (Go, C,
+		// PHP, ...) keep the historical "first local wins" rule so their
+		// shadowing and pointer semantics stay unchanged.
+		preferLocal := true
+		if b.GetLanguage() == ssaconfig.Yak {
+			preferLocal = preferLocalVariable(ret, local)
+		}
+		if local != nil && preferLocal &&
+			ret.GetCaptured() != nil && local.GetCaptured() != nil &&
+			ret.GetCaptured().GetGlobalIndex() != local.GetCaptured().GetGlobalIndex() {
 			ret = local
 		}
 		if b.CurrentRange != nil {
@@ -155,9 +167,9 @@ func (b *FunctionBuilder) readValueEx(
 				program.SetOffsetVariable(ret, b.CurrentRange)
 			}
 		}
-		if ret.Value != nil {
+		if value := ret.GetValue(); value != nil {
 			// has value, just return
-			return ret.Value
+			return value
 		}
 	}
 	val := b.readValueFromIncludeStack(name)
@@ -296,7 +308,7 @@ func (b *FunctionBuilder) AssignVariable(variable *Variable, value Value) {
 		log.Errorf("assign variable %q: current block is nil (%s)", name, b.builderDebugContext())
 		return
 	}
-	if _, captured := b.capturedNames[name]; captured {
+	if b.capturedNames != nil && b.capturedNames.Have(name) {
 		markCapturedByClosure(value)
 	}
 	scope := b.CurrentBlock.ScopeTable
@@ -439,7 +451,7 @@ func (b *FunctionBuilder) AssignVariable(variable *Variable, value Value) {
 		}
 	}
 
-	if val, ok := b.RefParameter[variable.GetName()]; ok {
+	if val, ok := b.lookupRefParameter(variable.GetName()); ok {
 		b.AddForceSideEffect(variable, value, val.Index, val.Kind)
 	}
 	if value.GetName() == variable.GetName() {
@@ -481,7 +493,7 @@ func (b *FunctionBuilder) AssignVariable(variable *Variable, value Value) {
 			scope.RegisterCapturedVariable(variable)
 		}
 	}
-	if _, ok := b.RefParameter[variable.GetName()]; !ok {
+	if _, ok := b.lookupRefParameter(variable.GetName()); !ok {
 		b.CheckMemberSideEffect(variable, value)
 	}
 
@@ -698,7 +710,12 @@ func (b *FunctionBuilder) getParentFunctionVariable(name string) (Value, bool) {
 	parentScope := b.parentScope
 	for parentScope != nil {
 		if parentVariable := ReadVariableFromScopeAndParent(parentScope.scope, name); parentVariable != nil {
-			return parentVariable.Value, true
+			// A released value keeps its id and reloads through GetValue. The
+			// bare Value field is nil after release, so returning it as a found
+			// value handed a nil interface to SetDefault.
+			if value := parentVariable.GetValue(); !utils.IsNil(value) {
+				return value, true
+			}
 		}
 		parentScope = parentScope.next
 	}

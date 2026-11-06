@@ -1,6 +1,8 @@
 package ssa
 
 import (
+	"sync/atomic"
+
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/utils/memedit"
 )
@@ -76,9 +78,12 @@ type Blueprint struct {
 	// outside SafeMap's lock; ForEach already drops the lock before its callback.
 	MagicMethod *utils.SafeMapWithKey[BlueprintMagicMethodKind, Value]
 
-	NormalMember map[string][]Value
-	StaticMember map[string][]Value
-	ConstValue   map[string][]Value
+	// Member lists and their value-to-field lookup are published atomically.
+	// Readers retain immutable slices; rewriting one ID need not scan every
+	// other member history in every blueprint.
+	NormalMember *blueprintMemberMap
+	StaticMember *blueprintMemberMap
+	ConstValue   *blueprintMemberMap
 
 	CallBack []func()
 
@@ -95,6 +100,9 @@ type Blueprint struct {
 	InterfaceBlueprints []*Blueprint
 	// full Type Name, insertion order, capped.
 	fullTypeName orderedTypeNames
+	// relationGen bumps when persisted blueprint links change. Type flush
+	// treats it as part of the map-cache identity.
+	relationGen atomic.Uint64
 
 	// lazy
 	*LazyBuilder
@@ -112,9 +120,9 @@ func NewBlueprint(name string) *Blueprint {
 		id:           -1,
 		Name:         name,
 		Kind:         BlueprintNone,
-		NormalMember: make(map[string][]Value),
-		StaticMember: make(map[string][]Value),
-		ConstValue:   make(map[string][]Value),
+		NormalMember: newBlueprintMemberMap(),
+		StaticMember: newBlueprintMemberMap(),
+		ConstValue:   newBlueprintMemberMap(),
 
 		NormalMethod: make(map[string]*Function),
 		StaticMethod: make(map[string]*Function),
@@ -264,30 +272,15 @@ func (c *Blueprint) addParentBlueprintEx(parent *Blueprint, relation BlueprintRe
 			return true
 		})
 	}
-	for name, values := range parent.NormalMember {
-		if len(c.NormalMember[name]) > 0 {
-			continue
-		}
-		for _, value := range values {
-			c.RegisterNormalMember(name, value, false)
-		}
-	}
-	for name, values := range parent.StaticMember {
-		if len(c.StaticMember[name]) > 0 {
-			continue
-		}
-		for _, value := range values {
-			c.RegisterStaticMember(name, value, false)
-		}
-	}
-	for name, values := range parent.ConstValue {
-		if len(c.ConstValue[name]) > 0 {
-			continue
-		}
-		for _, value := range values {
-			c.RegisterConstMember(name, value, false)
-		}
-	}
+	inheritBlueprintMembers(c.NormalMember, parent.NormalMember, func(name string, value Value) {
+		c.RegisterNormalMember(name, value, false)
+	})
+	inheritBlueprintMembers(c.StaticMember, parent.StaticMember, func(name string, value Value) {
+		c.RegisterStaticMember(name, value, false)
+	})
+	inheritBlueprintMembers(c.ConstValue, parent.ConstValue, func(name string, value Value) {
+		c.RegisterConstMember(name, value, false)
+	})
 }
 
 func (c *Blueprint) GetInterfaceBlueprint() []*Blueprint {
@@ -478,6 +471,14 @@ func (c *Blueprint) storeField(name string, val Value, _type BlueprintFieldKind)
 	unlock := fn.lockEmit()
 	defer unlock()
 	builder := fn.builder
+	if builder == nil || builder.CurrentBlock == nil {
+		// A finished container may have had its body scopes released. Rebuild
+		// the placeholder scope so a later static field can still be stored.
+		builder = fn.GetOrCreateBuilder()
+	}
+	if builder == nil || builder.CurrentBlock == nil {
+		return
+	}
 	createVariable(builder, builder.CreateMemberCallVariable(c._container, builder.EmitConstInstPlaceholder(name)))
 }
 
@@ -510,6 +511,7 @@ func (b *Blueprint) InitializeWithContainer(con Value) error {
 		return utils.Errorf("the container is already initialized id:(%v)", b._container.GetId())
 	}
 	b._container = con
+	b.relationGen.Add(1)
 	return nil
 }
 
@@ -521,5 +523,9 @@ func (c *Blueprint) SetKind(kind BlueprintKind) {
 	if c == nil {
 		return
 	}
+	if c.Kind == kind {
+		return
+	}
 	c.Kind = kind
+	c.relationGen.Add(1)
 }
