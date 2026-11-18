@@ -43,7 +43,7 @@ var _ sfvm.ValueOperator = (*StructQueryTarget)(nil)
 
 func NewStructQueryTarget(prog *Program, unit *ssa.CompileUnit, bound *structBound) *StructQueryTarget {
 	if bound == nil && unit != nil && prog != nil && prog.Program != nil {
-		bound = newStructBound(unit, prog.Program)
+		bound = prog.getStructBound(unit)
 	}
 	return &StructQueryTarget{prog: prog, unit: unit, bound: bound}
 }
@@ -153,7 +153,8 @@ func (t *StructQueryTarget) CompareOpcode(opcodeItems *sfvm.OpcodeComparator) (s
 	if t == nil || t.prog == nil || t.prog.Program == nil || opcodeItems == nil {
 		return sfvm.NewEmptyValues(), nil
 	}
-	return ToSFVMValues(t.allowedInsts(t.matchOpcodes(opcodeItems.Opcodes...))), nil
+	insts := t.matchOpcodes(opcodeItems.Opcodes...)
+	return ToSFVMValues(t.allowedInsts(insts)), nil
 }
 
 func (t *StructQueryTarget) matchOpcodes(opcodes ...ssa.Opcode) []ssa.Instruction {

@@ -84,6 +84,20 @@ func NewHTTPFlowStreamRecorder(
 	return newHTTPFlowStreamRecorder(db, isHTTPS, req, rsp, headerBytes, sizeThreshold, InsertHTTPFlow)
 }
 
+func NewHTTPFlowStreamRecorderObserved(
+	db *gorm.DB,
+	isHTTPS bool,
+	req *http.Request,
+	rsp *http.Response,
+	headerBytes []byte,
+	sizeThreshold int64,
+	observe func() HTTPFlowWriteObserver,
+) (*HTTPFlowStreamRecorder, error) {
+	return newHTTPFlowStreamRecorder(db, isHTTPS, req, rsp, headerBytes, sizeThreshold, func(db *gorm.DB, flow *schema.HTTPFlow) error {
+		return InsertHTTPFlowObserved(db, flow, observe())
+	})
+}
+
 func newHTTPFlowStreamRecorder(
 	db *gorm.DB,
 	isHTTPS bool,
@@ -113,6 +127,9 @@ func newHTTPFlowStreamRecorder(
 	flow, err := CreateHTTPFlowFromHTTPWithNoRspSaved(isHTTPS, req, "mitm", requestURL, remoteAddr)
 	if err != nil {
 		return nil, utils.Wrap(err, "create initial HTTP stream flow")
+	}
+	if identity, ok := httpctx.GetBrowserInstance(req); ok {
+		ApplyBrowserInstanceToHTTPFlow(flow, identity)
 	}
 	flow.SetResponse(string(headerBytes))
 	flow.StatusCode = int64(rsp.StatusCode)
@@ -272,7 +289,7 @@ func (r *HTTPFlowStreamRecorder) markTooLarge() {
 		go func() {
 			err := r.db.Model(&schema.HTTPFlow{}).Where("id = ?", flowID).UpdateColumns(map[string]any{
 				"is_read_too_slow_response":      true,
-				"is_too_large_response":           true,
+				"is_too_large_response":          true,
 				"too_large_response_header_file": r.headerFile,
 				"too_large_response_body_file":   r.bodyPath,
 				"updated_at":                     time.Now(),
@@ -378,9 +395,9 @@ func (r *HTTPFlowStreamRecorder) updateProgress(syncFile bool) {
 	r.mu.Unlock()
 
 	updates := map[string]any{
-		"body_length":  bodyLength,
-		"duration":     int64(duration),
-		"updated_at":   time.Now(),
+		"body_length": bodyLength,
+		"duration":    int64(duration),
+		"updated_at":  time.Now(),
 	}
 	if tooLargeMarked || sizeThreshold <= 0 {
 		updates["is_read_too_slow_response"] = true
@@ -465,6 +482,10 @@ func (r *HTTPFlowStreamRecorder) BodyLength() int64 {
 // Finalize updates the header-first row instead of inserting a duplicate after
 // the ordinary MITM response mirror finally observes EOF.
 func (r *HTTPFlowStreamRecorder) Finalize(flow *schema.HTTPFlow) error {
+	return r.FinalizeObserved(flow, nil)
+}
+
+func (r *HTTPFlowStreamRecorder) FinalizeObserved(flow *schema.HTTPFlow, observe func() HTTPFlowWriteObserver) error {
 	if r == nil || flow == nil || r.initialFlow == nil {
 		return utils.Error("finalize HTTP stream flow: invalid recorder or flow")
 	}
@@ -506,6 +527,9 @@ func (r *HTTPFlowStreamRecorder) Finalize(flow *schema.HTTPFlow) error {
 			fullPacket = append(fullPacket, bodyBuffer.Bytes()...)
 		}
 		flow.SetResponse(string(fullPacket))
+	}
+	if observe != nil {
+		return saveHTTPFlow(r.db, flow, observe())
 	}
 	return SaveHTTPFlow(r.db, flow)
 }

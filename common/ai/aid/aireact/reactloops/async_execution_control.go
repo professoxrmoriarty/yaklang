@@ -1,64 +1,41 @@
 package reactloops
 
-import "github.com/yaklang/yaklang/common/ai/aid/aicommon"
+import "github.com/yaklang/yaklang/common/utils"
 
-// This signal belongs to the loop, never to a returned action operator. A
-// background review cannot generate a concurrent answer or exit another agent.
+const asyncDirectAnswerTimelineInstruction = `用户在后台工具调用审批中要求直接回答。
+
+不要继续调用业务工具，也不要继续等待或执行后台任务。请依据当前 Timeline 中已经获得的信息，下一步使用 directly_answer 回答用户；已经取消或尚未完成的工作需要明确说明。`
+
+// The ReAct runtime owns the direct-answer signal so it can wake the current or
+// next task loop. A background review cannot exit another ReAct session.
 func (r *ReActLoop) AsyncDirectAnswerSignal() <-chan struct{} {
-	r.onReleaseMutex.Lock()
-	defer r.onReleaseMutex.Unlock()
-	if r.asyncDirectAnswer == nil {
-		r.asyncDirectAnswer = make(chan struct{})
+	if r == nil || utils.IsNil(r.invoker) {
+		return nil
 	}
-	return r.asyncDirectAnswer
+	return r.invoker.AsyncDirectAnswerSignal()
 }
 func (r *ReActLoop) RequestAsyncDirectAnswer() {
-	r.onReleaseMutex.Lock()
-	if r.released || r.asyncDirectAnswerRequested {
-		r.onReleaseMutex.Unlock()
+	if r == nil || utils.IsNil(r.invoker) {
 		return
 	}
-	if r.asyncDirectAnswer == nil {
-		r.asyncDirectAnswer = make(chan struct{})
-	}
-	r.asyncDirectAnswerRequested = true
-	close(r.asyncDirectAnswer)
-	manager := r.asyncExecutionManager
-	r.onReleaseMutex.Unlock()
-	if manager != nil {
-		manager.Close()
-	}
+	r.invoker.RequestAsyncDirectAnswer()
 }
-func (r *ReActLoop) asyncReviewRequiresAnswer() bool {
-	select {
-	case <-r.AsyncDirectAnswerSignal():
-		return true
-	default:
+
+// handleAsyncDirectAnswerSignal 消费一次用户审批直答请求并写入 Timeline。
+// 主循环只在一处调用；后续轮次通过正常 Prompt 让 AI 自行选择 directly_answer。
+func (r *ReActLoop) handleAsyncDirectAnswerSignal() bool {
+	if r == nil {
 		return false
 	}
-}
-func (r *ReActLoop) answerAsyncReview(task aicommon.AIStatefulTask) error {
+	if utils.IsNil(r.invoker) {
+		return false
+	}
+	if !r.invoker.ConsumeAsyncDirectAnswer() {
+		return false
+	}
 	r.StopSubAgentsForUser()
-	r.onReleaseMutex.Lock()
-	manager := r.asyncExecutionManager
-	r.onReleaseMutex.Unlock()
-	if manager != nil {
-		manager.Close()
+	if invoker := r.GetInvoker(); invoker != nil {
+		invoker.AddToTimeline("async-direct-answer-request", asyncDirectAnswerTimelineInstruction)
 	}
-	answer, err := r.invoker.DirectlyAnswer(task.GetContext(), "用户在后台工具调用审批中要求直接回答。停止继续调用工具，根据已有信息回答用户。", nil)
-	if err == nil {
-		r.invoker.AddToTimeline("directly-answer", answer)
-		// This host-directed answer bypasses execOneCall. Record its delivery
-		// so ordinary finalizers do not see the preceding tool action and
-		// generate a second answer. It executes no tool callbacks.
-		r.actionHistoryMutex.Lock()
-		r.actionHistory = append(r.actionHistory, &ActionRecord{
-			ActionType:     loopAction_DirectlyAnswer.ActionType,
-			ActionName:     loopAction_DirectlyAnswer.ActionType,
-			ActionParams:   map[string]interface{}{"answer_payload": answer},
-			IterationIndex: r.currentIterationIndex,
-		})
-		r.actionHistoryMutex.Unlock()
-	}
-	return err
+	return true
 }

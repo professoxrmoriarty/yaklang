@@ -1,13 +1,25 @@
 ---
 name: pcap-analysis
-description: 分析本地 PCAP/PCAPNG 捕获文件，用独立 pcapdb 流量库检索协议字段、物理包、网络会话和方向流，并根据可追溯证据回答问题。
+description: 启动异步实时抓包，或分析本地 PCAP/PCAPNG；统一用 pcapdb 流量库检索协议字段、物理包、网络会话和方向流，并根据可追溯证据回答问题。
 metadata:
-  display_name_zh-CN: 离线流量分析
+  display_name_zh-CN: 流量分析与实时抓包
 ---
 
-# 离线流量分析
+# 流量分析与实时抓包
 
-适用于用户给出本地 PCAP/PCAPNG 文件，或此前导入得到的 pcapdb DatasetID。Yakit 项目的 HTTP 历史使用 yaklang-system；这里查询的是独立捕获库。
+适用于实时抓包、本地 PCAP/PCAPNG 文件，或已有的 pcapdb DatasetID。Yakit 项目的 HTTP 历史使用 yaklang-system；这里查询的是独立捕获库。
+
+## 实时抓包
+
+1. 通过 require_tool 加载 `list_pcap_interfaces` 和 `start_pcap_capture`，列出设备并明确选择一个 interface。BPF 是入口过滤，query_pcapdb 的 protocol/IP 等条件是查询过滤。
+2. `start_pcap_capture` 默认异步，无需显式设置 async。省略 duration_seconds 或传 0 表示持续捕获；启动后会在当前 ReAct 会话内常驻，本次 task 正常结束不会停止，后续 task 可继续查询和管理，直到显式停止或会话结束。提交只返回 execute_id，不能据此宣称网卡已经成功打开。
+   打开网卡遇到权限错误时会调用现有 pcapfix 修复流程，macOS 会弹出系统管理员授权框，成功后重试一次；已有权限或网卡/驱动等非权限错误不触发授权。用户取消授权时报告失败，不自行重复启动。授权过程跟随当前任务取消。
+3. 用顶层 action `manage_async_execution_runtime(op=inspect,execute_id=...)` 读取执行 stdout，启动成功后会输出一行包含 dataset_id 的 JSON；execute_id 丢失时先用 `op=list` 查找。启动失败需要检查执行错误，不能解释为没有流量，也不要通过 wait 等待持续抓包启动或结束。
+4. 取得 dataset_id 后用原来的 `query_pcapdb(id=dataset_id)` 查询 metadata、protocols、sessions、streams、details 等。如果用户的目标只是启动抓包，确认启动成功并报告 dataset_id 后即可正常结束本轮回答，后续 task 继续使用同一个 dataset_id。
+5. has_more=false 或空页只描述当前已提交结果，不表示捕获结束。after 用于普通分页，不能跟踪旧 session 的关闭或 stream 计数更新；需要时重新查询对应会话/流或 metadata。
+6. 停止使用 `manage_async_execution_runtime(op=stop,execute_id=...)`，再由 wait 确认清理结束并 inspect 核对结果。stopping 只表示已请求取消，wait 超时也不会取消抓包。执行 cancelled 与流量库 ready 可以同时成立；停止保留原 dataset_id 和证据记录 ID，不再调用 load_pcapfile。
+
+活动库的删除、重建、深校验及全量导出需要先停止抓包。异常后已提交证据仍保留，当前数据页不代表捕获完整。实时捕获不参与文件去重，不要把 full_sha256 为空解释为数据库不可查询。
 
 PCAP/PCAPNG 的应用层问题默认走本 Skill 的结构化链路。`read_file` 的二进制提示和本地 shell 中没有 tshark 都不构成手工解析 pcapng 或拼接 TCP 载荷的理由。包级摘要不能替代协议字段、会话、流和证据分析；这些问题应使用 `load_pcapfile + query_pcapdb`。
 

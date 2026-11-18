@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -37,6 +38,33 @@ func getDoHTTPRequestTool(t *testing.T) *aitool.Tool {
 		t.Fatalf("ConvertTools returned empty, toolCovertHandle may not be registered")
 	}
 	return tools[0]
+}
+
+func TestDoHTTPRequestRejectsEmptyFuzzTagExpansionBeforeIndexing(t *testing.T) {
+	content, err := yakscripttools.GetEmbedFS().ReadFile("yakscriptforai/http/do_http_request.yak")
+	assert.NilError(t, err)
+	const renderFields = "rows, renderErr = fuzz.RenderHTTPFields(fields, variables, maxRequests, requestCtx)"
+	assert.Assert(t, strings.Contains(string(content), renderFields), "render call marker changed; update this regression test")
+	mutated := strings.Replace(string(content), renderFields, "rows, renderErr = [], nil", 1)
+	metadata := yakscripttools.LoadYakScriptToAiTools(doHTTPRequestToolName, mutated)
+	assert.Assert(t, metadata != nil, "mutated tool must remain parseable")
+	tools := yakscripttools.ConvertTools([]*schema.AIYakTool{metadata})
+	assert.Equal(t, len(tools), 1)
+
+	result, err := tools[0].InvokeWithParams(aitool.InvokeParams{
+		"url":       "http://127.0.0.1/",
+		"fuzztag":   true,
+		"timeout":   1,
+		"verbose":   false,
+		"https":     "no",
+		"method":    http.MethodGet,
+		"max-retry": 0,
+	})
+	assert.Assert(t, err != nil, "empty render result must stop before indexing requestItems")
+	assert.Assert(t, result != nil)
+	assert.Assert(t, strings.Contains(result.Error, "no HTTP request variants were produced before sending"), result.Error)
+	assert.Assert(t, strings.Contains(result.Error, "no request was sent"), result.Error)
+	assert.Assert(t, !strings.Contains(result.Error, "slice call error"), result.Error)
 }
 
 func TestDoHTTPRequestUsageExplainsExperimentAndRecovery(t *testing.T) {
@@ -366,6 +394,30 @@ func TestDoHTTPRequest_PacketMode(t *testing.T) {
 	assert.Assert(t, strings.Contains(stdout, flag), "packet mode response should contain flag")
 	assert.Assert(t, strings.Contains(stdout, "request packet"), "request should be printed in packet mode")
 	assert.Assert(t, strings.Contains(stdout, "X-Custom-Test"), "custom header should appear in request output")
+}
+
+func TestDoHTTPRequest_PacketFileMode(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/packet-file" || r.Header.Get("X-Replay-Source") != "risk-evidence" {
+			http.Error(w, "unexpected replay", http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write([]byte("packet-file-replay-ok"))
+	}))
+	defer server.Close()
+
+	requestPath := t.TempDir() + "/risk-request.http"
+	rawRequest := "GET /packet-file HTTP/1.1\r\nHost: " +
+		server.Listener.Addr().String() +
+		"\r\nX-Replay-Source: risk-evidence\r\n\r\n"
+	assert.NilError(t, os.WriteFile(requestPath, []byte(rawRequest), 0o600))
+
+	result := execHTTPToolResult(t, aitool.InvokeParams{
+		"packet-file": requestPath,
+		"timeout":     5,
+	})
+	assert.Equal(t, utils.InterfaceToInt(result["status_code"]), http.StatusOK)
+	assert.Equal(t, utils.InterfaceToBoolean(result["response_received"]), true)
 }
 
 func TestDoHTTPRequest_CustomHeaders(t *testing.T) {

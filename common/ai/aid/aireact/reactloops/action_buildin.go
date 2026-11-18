@@ -35,15 +35,11 @@ func buildExitBlockedByTodoMessage(actionName string, items []aicommon.Verificat
 }
 
 func buildFinishBlockedByGoalModeMessage() string {
-	return "goal mode's host-side completion gate is not open yet. Do not retry finish or clear unfinished TODOs to satisfy it. Continue the most valuable evidence-producing work, and use directly_answer only for a necessary progress update."
+	return "目标模式的宿主完成门禁尚未开放。不要反复请求 finish 或清空未完成待办来过关；继续最有价值的验证与执行，仅在必要时用 directly_answer 汇报进度。"
 }
 
 func buildFinishBlockedByDeadlineMessage(remaining time.Duration) string {
-	return fmt.Sprintf("goal mode time window is still active (%s remaining). Do not retry finish. Continue the most valuable evidence-producing work; explore deeper angles, verify earlier results, or address remaining TODOs.", remaining.Round(time.Second))
-}
-
-func buildFinishBlockedByAcceptanceMessage(reason string) string {
-	return fmt.Sprintf("goal mode acceptance criteria are not satisfied yet: %s. Do not retry finish or clear unfinished TODOs to bypass this. Address the gaps above with concrete tool actions and evidence, then attempt finish again.", reason)
+	return fmt.Sprintf("目标时间窗尚未结束，剩余 %d 秒。不要反复请求 finish；继续深入探索、验证已有结果或处理剩余待办。", remaining.Round(time.Second)/time.Second)
 }
 
 var loopAction_Finish = &LoopAction{
@@ -64,6 +60,14 @@ var loopAction_Finish = &LoopAction{
 		if reason := loop.SubAgentFinishBlockReason(); reason != "" {
 			operator.Feedback(reason)
 			operator.Continue()
+			return
+		}
+		if loop.isGoalAcceptanceMode() {
+			if loop.invoker != nil {
+				loop.invoker.AddToTimeline("[GOAL_ACCEPTANCE_CONFIRMED]",
+					"the main model confirmed that the configured acceptance criteria are satisfied")
+			}
+			operator.Exit()
 			return
 		}
 		if loop.ShouldBlockFinishAtIteration(loop.GetCurrentIterationIndex()) {
@@ -89,14 +93,6 @@ var loopAction_Finish = &LoopAction{
 			operator.Continue()
 			return
 		}
-		// Gate 3: Acceptance criteria — LLM review of work quality.
-		if review := loop.CheckGoalAcceptanceCriteria(loop.GetCurrentTask().GetContext()); review != nil && !review.Passed {
-			msg := buildFinishBlockedByAcceptanceMessage(review.Reason)
-			loop.invoker.AddToTimeline("[GOAL_MODE_ACCEPTANCE_BLOCKED]", msg)
-			operator.Feedback(msg)
-			operator.Continue()
-			return
-		}
 		// Only a finish request with remaining work needs a TODO checkpoint.
 		// Empty tasks must not spend another model turn confirming termination.
 		if items := aicommon.GetBlockingVerificationTodoItems(loop.GetConfig(), loop.GetCurrentTask()); len(items) > 0 {
@@ -104,6 +100,20 @@ var loopAction_Finish = &LoopAction{
 			loop.requestFinishTodoCheckpoint()
 			loop.invoker.AddToTimeline("[FINISH_BLOCKED_BY_TODO]", msg)
 			operator.Feedback(msg)
+			operator.Continue()
+			return
+		}
+		// Gate 3: Acceptance criteria — after every host hard gate passes, ask the
+		// main model for one dedicated acceptance decision using the same context.
+		if loop.armGoalAcceptanceReview() {
+			msg := fmt.Sprintf(`【必须执行 Goal 验收】再次调用 finish 前，必须依据当前上下文中已有的目标、计划、工具调用和真实结果，逐项核对以下验收标准：
+
+%s
+
+只有每一条标准都有具体证据支持时，才能再次选择 finish 结束任务。任一标准缺失证据、尚未验证、结果矛盾或仍被阻塞时，必须选择实际工作 action 补齐缺口；不要用文字说明、TODO 状态变更或再次 finish 代替执行。`, loop.goalAcceptanceCriteria())
+			if loop.invoker != nil {
+				loop.invoker.AddToTimeline("[GOAL_ACCEPTANCE_REVIEW]", msg)
+			}
 			operator.Continue()
 			return
 		}

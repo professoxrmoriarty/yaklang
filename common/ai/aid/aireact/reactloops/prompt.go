@@ -308,10 +308,11 @@ type loopPromptBuildInput struct {
 	operator          *LoopActionHandlerOperator
 
 	// Captured exactly once per iteration: these reads mutate loop state.
-	subAgentInput    string
-	subAgentRevision uint64
-	todoCheckpoint   string
-	actionSchemas    *loopPromptActionSchemas
+	subAgentInput            string
+	subAgentRevision         uint64
+	subAgentEvidenceRevision uint64
+	todoCheckpoint           string
+	actionSchemas            *loopPromptActionSchemas
 	// overflowCompression asks this rebuild to compress only through the last
 	// provider-accepted timeline boundary.
 	overflowCompression bool
@@ -333,17 +334,21 @@ func (r *ReActLoop) captureLoopPromptBuildInput(
 	memory string,
 	operator *LoopActionHandlerOperator,
 ) *loopPromptBuildInput {
+	// Publication writes the parent evidence journal before advancing this
+	// cursor. Capture before projection so only model-visible saves are acked.
+	evidenceRevision := r.subAgentSharedEvidenceRevision()
 	subAgentInput, subAgentRevision := r.prepareSubAgentPrompt()
 	return &loopPromptBuildInput{
-		nonce:             nonce,
-		userInput:         userInput,
-		frozenUserContext: frozenUserContext,
-		frozenPartitions:  frozenPartitions,
-		memory:            memory,
-		operator:          operator,
-		subAgentInput:     subAgentInput,
-		subAgentRevision:  subAgentRevision,
-		todoCheckpoint:    r.consumeTodoCheckpoint(),
+		nonce:                    nonce,
+		userInput:                userInput,
+		frozenUserContext:        frozenUserContext,
+		frozenPartitions:         frozenPartitions,
+		memory:                   memory,
+		operator:                 operator,
+		subAgentInput:            subAgentInput,
+		subAgentRevision:         subAgentRevision,
+		subAgentEvidenceRevision: evidenceRevision,
+		todoCheckpoint:           r.consumeTodoCheckpoint(),
 	}
 }
 
@@ -373,7 +378,7 @@ func (r *ReActLoop) generateLoopPromptFromInput(input *loopPromptBuildInput) (*L
 	}
 	nonce, frozenUserContext := input.nonce, input.frozenUserContext
 	frozenPartitions, memory, operator := input.frozenPartitions, input.memory, input.operator
-	subAgentInput, subAgentRevision := input.subAgentInput, input.subAgentRevision
+	subAgentInput := input.subAgentInput
 	var tools []*aitool.Tool
 	if r.toolsGetter == nil {
 		tools = []*aitool.Tool{}
@@ -398,7 +403,8 @@ func (r *ReActLoop) generateLoopPromptFromInput(input *loopPromptBuildInput) (*L
 	if !r.functionCallMode && r.outputExampleProvider != nil {
 		outputExample, err = r.outputExampleProvider(r, "") // persistent context not use nonce
 		if err != nil {
-			return nil, utils.Wrap(err, "build output example failed")
+			log.Warnf("build output example failed; continuing without an output example: %v", err)
+			outputExample = ""
 		}
 	}
 
@@ -406,7 +412,9 @@ func (r *ReActLoop) generateLoopPromptFromInput(input *loopPromptBuildInput) (*L
 	if r.reactiveDataBuilder != nil {
 		reactiveData, err = r.reactiveDataBuilder(r, operator.GetFeedback(), nonce)
 		if err != nil {
-			return nil, utils.Wrap(err, "build reactive data failed")
+			log.Warnf("build reactive data failed; continuing without it: %v", err)
+			reactiveData = ""
+			err = nil
 		}
 		if reactiveData != "" {
 			utils.Debug(func() {
@@ -419,6 +427,9 @@ func (r *ReActLoop) generateLoopPromptFromInput(input *loopPromptBuildInput) (*L
 	// Keep deliveries in the formal dynamic section so prompt analysis and the
 	// model request agree about which evidence belongs to this iteration.
 	reactiveData += subAgentInput
+	// Replaceable task-local definitions: never append schemas to feedback or
+	// Timeline, where old loads would survive eviction and accumulate forever.
+	reactiveData += r.renderUIComponents()
 	todoCheckpoint := input.todoCheckpoint
 
 	// Render extra capabilities discovered via intent recognition
@@ -531,28 +542,20 @@ func (r *ReActLoop) generateLoopPromptFromInput(input *loopPromptBuildInput) (*L
 		}
 		return result, nil
 	}
-	fallbackToNormal := func(stage string, cause error) (*LoopPromptAssemblyResult, error) {
-		r.emitContextCompressionRuntimeWarning(stage, cause)
-		assembly.PromptMode = aicommon.LoopPromptModeNormal
-		assembly.CompressionGuide = ""
-		return assemble()
-	}
+	// 先缓存已经成功生成的普通 Prompt；后续压缩任一步失败时直接返回它。
+	var normalResult *LoopPromptAssemblyResult
 	limit := r.wholePromptTokenLimit()
-	result, err := assemble()
+	normalResult, err = assemble()
 	if err != nil {
 		return nil, err
 	}
+	result := normalResult
 	promptTokens := int64(aicommon.MeasureTokens(result.Prompt))
-	var compressionSelectionErr error
-	if operator != nil {
-		compressionSelectionErr = operator.contextCompressionError
-	}
 
-	// A selection error is a correction retry, independent of prompt volume.
 	// overflowCompression is a provider signal and may use the last fitting
 	// timeline boundary; an ordinary over-limit prompt keeps the full history.
 	if timeline := timelineFromConfig(r.config); timeline != nil &&
-		(compressionSelectionErr != nil || input.overflowCompression || promptTokens > limit) {
+		(input.overflowCompression || promptTokens > limit) {
 		ctx := r.config.GetContext()
 		if task := r.GetCurrentTask(); task != nil && task.GetContext() != nil {
 			ctx = task.GetContext()
@@ -568,27 +571,24 @@ func (r *ReActLoop) generateLoopPromptFromInput(input *loopPromptBuildInput) (*L
 		}
 		guide, guideErr := timeline.RenderCompressionGuide(options)
 		if guideErr != nil || strings.TrimSpace(guide) == "" {
+			r.recordContextCompressionFailure("rendering the compression guide", guideErr)
 			r.emitContextCompressionUnavailable(promptTokens, limit, guideErr)
-			result, err = assemble()
-			if err != nil {
-				return nil, err
-			}
-			return result, nil
+			return r.commitSubAgentPromptAssembly(input, normalResult), nil
 		}
 		instructions, err := aicommon.RenderPromptTemplate("timeline-compression", compressContextDynamicText,
 			map[string]any{"FunctionCallMode": r.functionCallMode})
 		if err != nil {
-			return fallbackToNormal("rendering the compression instructions", err)
+			r.recordContextCompressionFailure("rendering the compression instructions", err)
+			r.emitContextCompressionRuntimeWarning("rendering the compression instructions", err)
+			return r.commitSubAgentPromptAssembly(input, normalResult), nil
 		}
 		assembly.PromptMode = aicommon.LoopPromptModeCompressContext
 		assembly.CompressionGuide = strings.TrimSpace(instructions) + "\n\n" + guide
-		if compressionSelectionErr != nil {
-			assembly.CompressionGuide += "\n\n# 上次压缩选择未通过校验\n请修正以下错误，重新提交 compress_context；当前历史尚未按这次无效选择修改。\n" +
-				utils.ShrinkString(compressionSelectionErr.Error(), 2048)
-		}
 		result, err = assemble()
 		if err != nil {
-			return fallbackToNormal("assembling the compression prompt", err)
+			r.recordContextCompressionFailure("assembling the compression prompt", err)
+			r.emitContextCompressionRuntimeWarning("assembling the compression prompt", err)
+			return r.commitSubAgentPromptAssembly(input, normalResult), nil
 		}
 		compressionPromptLimit := r.contextCompressionPromptTokenLimit()
 		compressionPromptTokens := int64(aicommon.MeasureTokens(result.Prompt))
@@ -599,9 +599,16 @@ func (r *ReActLoop) generateLoopPromptFromInput(input *loopPromptBuildInput) (*L
 			)
 		}
 	}
-	r.commitSubAgentPrompt(subAgentRevision)
-	r.subAgentModelSeen = subAgentRevision
-	return result, nil
+	return r.commitSubAgentPromptAssembly(input, result), nil
+}
+
+func (r *ReActLoop) commitSubAgentPromptAssembly(input *loopPromptBuildInput, result *LoopPromptAssemblyResult) *LoopPromptAssemblyResult {
+	r.commitSubAgentPrompt(input.subAgentRevision)
+	r.subAgentModelSeen = input.subAgentRevision
+	if result.Mode != aicommon.LoopPromptModeCompressContext {
+		r.subAgentEvidenceSeen = input.subAgentEvidenceRevision
+	}
+	return result
 }
 
 // syncRecentToolParamAITagFields 给当前 react loop 的 aiTagFields 注册

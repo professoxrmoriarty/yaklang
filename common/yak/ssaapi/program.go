@@ -3,6 +3,7 @@ package ssaapi
 import (
 	"context"
 	"sort"
+	"sync"
 	goatomic "sync/atomic"
 	"time"
 
@@ -50,6 +51,18 @@ type Program struct {
 	// *Value graph ops (GetCalled / GetUsers) can filter without sfvm.Config.
 	structBound      *structBound
 	structScanActive bool
+
+	// structBoundCache keeps one immutable path filter per compile unit.
+	// A struct query used to rebuild the unit's file-path set for every rule,
+	// which made the same map live once per concurrent query.
+	structBoundCache sync.Map
+
+	// auditEdgeCacheOnce builds the per-result snapshot cache on first use.
+	// Report generation walks several results and rules, so one slot would
+	// reload whenever a later result revisits an earlier one. The cache keeps a
+	// small window of results, bounded by capacity and TTL.
+	auditEdgeCacheOnce sync.Once
+	auditEdgeSnapshots *utils.CacheExWithKey[uint, *auditEdgeSnapshot]
 }
 
 // resetInterRuleStateCacheThreshold is the default nodeId2ValueCache entry
@@ -89,6 +102,7 @@ func (p *Program) ResetInterRuleState() {
 	// don't observe a half-niled Value mid-reset.
 	entries := p.nodeId2ValueCache.GetAll()
 	p.nodeId2ValueCache.Purge()
+	p.resetAuditEdgeSnapshot()
 	goatomic.AddInt64(&p.InterRuleResetCount, 1)
 	for _, v := range entries {
 		if v == nil {

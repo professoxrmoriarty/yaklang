@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"reflect"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,25 +54,22 @@ const DefaultTimelineContentSizeLimit = 300 * 1024
 
 type ConfigOption func(*Config) error
 
-var configOptionIDRegistry sync.Map
+var configIDOptionCode = reflect.ValueOf(configIDOption("").apply).Pointer()
 
 const ConfigKeyToolCallIntervalReviewExtraPrompt = "tool_call_interval_review_extra_prompt"
 
-type configIDOptionMeta struct {
-	id  string
-	key uintptr
-}
+type configIDOption string
 
-func (o *configIDOptionMeta) apply(c *Config) error {
+func (id configIDOption) apply(c *Config) error {
 	if c.m == nil {
 		c.m = &sync.Mutex{}
 	}
 	c.m.Lock()
 	defer c.m.Unlock()
-	c.Id = o.id
+	c.Id = string(id)
 	// Also update Emitter's id to keep them in sync
 	if c.Emitter != nil {
-		c.Emitter.SetId(o.id)
+		c.Emitter.SetId(c.Id)
 	}
 	return nil
 }
@@ -86,8 +82,12 @@ func GetLastIDFromConfigOptions(opts ...ConfigOption) (string, bool) {
 		if opt == nil {
 			continue
 		}
-		if id, ok := configOptionIDRegistry.Load(reflect.ValueOf(opt).Pointer()); ok {
-			return id.(string), true
+		if reflect.ValueOf(opt).Pointer() == configIDOptionCode {
+			// The code pointer identifies WithID's method, not its receiver.
+			// Read this option's captured ID by applying only that known setter.
+			var probe Config
+			_ = opt(&probe)
+			return probe.Id, true
 		}
 	}
 	return "", false
@@ -266,7 +266,8 @@ type Config struct {
 	inheritedToolManager         bool
 
 	// browserSessionTracker records browser ids opened by yak tools for session cleanup.
-	browserSessionTracker BrowserSessionTracker
+	browserSessionTracker           BrowserSessionTracker
+	browserHTTPFlowIdentityResolver BrowserHTTPFlowIdentityResolver
 
 	// tool config
 	DisableToolUse               bool
@@ -315,6 +316,7 @@ type Config struct {
 	*/
 	// timeline
 	Timeline                  *Timeline
+	TimelineBroadcaster       *TimelineBroadcaster
 	TimelineContentSizeLimit  int // in tokens
 	TimelineTotalContentLimit int // in tokens
 
@@ -382,7 +384,7 @@ type Config struct {
 	EnableGoalMode           bool
 	GoalMinIterations        int64
 	GoalDurationSeconds      int64     // Goal mode time window in seconds; -1 = never auto-finish, 0 = disabled
-	GoalAcceptanceCriteria   string    // Goal mode acceptance criteria; non-empty enables LLM review gate
+	GoalAcceptanceCriteria   string    // Goal mode acceptance criteria; non-empty enables one main-model review turn
 	GoalDeadline             time.Time // Computed deadline for goal time window (zero = not started)
 	DisableIncreaseIteration bool
 
@@ -399,6 +401,11 @@ type Config struct {
 	singleAIModelMode                  bool // 单模型简易模式：辅助任务统一调度，详见 config_auxiliary_scheduler.go
 	singleAIModelModeResolved          bool // NewConfig freezes the effective mode after applying options.
 	PerTaskUserInteractiveLimitedTimes int64
+	userInteractLimitExplicit          bool
+	clarificationPolicy                func() (allowed, blocking bool, limit int64)
+	clarificationCounts                map[string]int64
+	clarificationMu                    sync.Mutex
+	disableBlockingClarification       bool
 
 	/*
 		Meta Info
@@ -664,6 +671,7 @@ func NewConfig(ctx context.Context, opts ...ConfigOption) *Config {
 	if consumptionState := config.ensureConsumptionState(); consumptionState != nil {
 		consumptionState.InitializeEffectiveSingleModelMode(config.IsSingleAIModelMode())
 	}
+	originTimeline := config.Timeline
 	// Only create new Timeline if not already set via options (e.g., WithTimeline)
 	// This ensures that when a parent coordinator passes its Timeline to a child invoker,
 	// the child uses the same Timeline instance for proper timeline diff tracking
@@ -706,14 +714,10 @@ func NewConfig(ctx context.Context, opts ...ConfigOption) *Config {
 		config.AiToolManager.SetDisallowMCPServers(config.DisallowMCPServers)
 	}
 
-	// Only the session owner restores the persistent journal. Inherited task
-	// configs already share that session; restoring again would replace their
-	// explicitly supplied Timeline branch with an older DB snapshot.
-	promptState := config.GetSessionPromptState()
-	promptState.m.RLock()
-	hasSessionTimeline := promptState.evidenceTimeline != nil
-	promptState.m.RUnlock()
-	if !config.InitStatus.IsPersistentSessionRestored() && !hasSessionTimeline {
+	// A Config constructed with an explicit Timeline owns that live runtime and
+	// must not replace it with an older row from the same persistent session.
+	// Fresh session owners still restore their checkpoint.
+	if !config.InitStatus.IsPersistentSessionRestored() && originTimeline == nil {
 		config.restorePersistentSession()
 	}
 
@@ -744,6 +748,7 @@ func NewConfig(ctx context.Context, opts ...ConfigOption) *Config {
 		config.applySingleModelModeDefaults()
 	}
 
+	config.initializeTimelineBroadcast()
 	return config
 }
 
@@ -848,14 +853,7 @@ func newConfig(ctx context.Context) *Config {
 
 // WithID sets the runtime id for the config.
 func WithID(id string) ConfigOption {
-	meta := &configIDOptionMeta{id: id}
-	opt := ConfigOption(meta.apply)
-	meta.key = reflect.ValueOf(opt).Pointer()
-	configOptionIDRegistry.Store(meta.key, id)
-	runtime.SetFinalizer(meta, func(m *configIDOptionMeta) {
-		configOptionIDRegistry.Delete(m.key)
-	})
-	return opt
+	return configIDOption(id).apply
 }
 
 // WithContext sets the context (and optional cancel) for the config.
@@ -2087,6 +2085,9 @@ func WithAllowRequireForUserInteract(v bool) ConfigOption {
 		c.m.Lock()
 		c.AllowRequireForUserInteract = v
 		c.m.Unlock()
+		if !v {
+			return c.cancelPendingClarifications()
+		}
 		return nil
 	}
 }
@@ -2885,6 +2886,7 @@ func WithPerTaskUserInteractiveLimitedTimes(n int64) ConfigOption {
 		}
 		c.m.Lock()
 		c.PerTaskUserInteractiveLimitedTimes = n
+		c.userInteractLimitExplicit = n > 0
 		c.m.Unlock()
 		return nil
 	}
@@ -3691,7 +3693,7 @@ func (c *Config) AppendUserInputHistory(userInput string, timestamp time.Time) (
 
 func (c *Config) GetSessionEvidenceRendered() string {
 	if c != nil {
-		if timeline := c.sessionEvidenceTimeline(); timeline != nil {
+		if timeline := c.GetTimeline(); timeline != nil {
 			if store, found := timeline.evidenceStore(); found {
 				return store.Render()
 			}
@@ -3701,20 +3703,28 @@ func (c *Config) GetSessionEvidenceRendered() string {
 }
 
 func (c *Config) ApplySessionEvidenceOps(ops []EvidenceOperation) {
+	c.ApplySessionEvidenceOpsWithChange(ops)
+}
+
+// ApplySessionEvidenceOpsWithChange reports an atomic business-content change;
+// timestamp-only retries do not notify consumers or grow the evidence journal.
+// The existing AICallerConfigIf write API remains unchanged.
+func (c *Config) ApplySessionEvidenceOpsWithChange(ops []EvidenceOperation) bool {
 	if c == nil || len(ops) == 0 {
-		return
+		return false
 	}
 	if c.GetTimeline() == nil {
 		state := c.GetSessionPromptState()
 		state.m.Lock()
 		defer state.m.Unlock()
 		store := UnmarshalEvidenceStore(state.evidenceJSON)
+		before := store.Render()
 		store.ApplyOperations(ops)
 		store.ShrinkToTokenBudget(sessionEvidenceTokenBudget)
 		state.evidenceJSON = store.Marshal()
-		return
+		return store.Render() != before
 	}
-	c.applyEvidenceToTimeline(ops)
+	return c.applyEvidenceToTimeline(ops)
 }
 
 // GetVerificationTodoRendered returns the rendered TODO snapshot for the
@@ -4026,21 +4036,10 @@ func (c *Config) SetBrowserSessionTracker(tracker BrowserSessionTracker) {
 }
 
 // AppendReportedRisk adds a compact summary of the given risk to the
-// session-level reported-risks store, deduplicating by target + type +
-// parameter. Called from the toolcall_invoke.go FeedBacker callback.
+// session-level ledger and broadcasts an immutable Timeline entry, deduplicating
+// by target + type + parameter. Called from toolcall_invoke.go FeedBacker.
 func (c *Config) AppendReportedRisk(risk *schema.Risk) bool {
-	if c == nil {
-		return false
-	}
-	return c.GetSessionPromptState().AppendReportedRisk(risk)
-}
-
-// GetReportedRisksRendered returns the markdown block for prompt injection.
-func (c *Config) GetReportedRisksRendered() string {
-	if c == nil {
-		return ""
-	}
-	return c.GetSessionPromptState().GetReportedRisksRendered()
+	return c.appendReportedRiskToTimeline(risk)
 }
 
 // GetReportedRisks returns the raw JSON for DB persistence.
@@ -4051,7 +4050,8 @@ func (c *Config) GetReportedRisks() string {
 	return c.GetSessionPromptState().GetReportedRisks()
 }
 
-// SetReportedRisks restores the reported-risks state from DB-persisted JSON.
+// SetReportedRisks explicitly imports legacy runtime ledger JSON without
+// changing Timeline history. It is not used by session restore.
 func (c *Config) SetReportedRisks(json string) {
 	if c == nil {
 		return
@@ -4105,6 +4105,10 @@ func (c *Config) GetMaxIterationCount() int64 {
 }
 
 func (c *Config) GetAllowUserInteraction() bool {
+	if c.m != nil {
+		c.m.Lock()
+		defer c.m.Unlock()
+	}
 	return c.AllowRequireForUserInteract
 }
 
@@ -4351,11 +4355,23 @@ func convertConfigToOptions(i *Config, inheritHotPatch bool) []ConfigOption {
 	}
 
 	opts := make([]ConfigOption, 0)
+	if i.TimelineBroadcaster != nil {
+		opts = append(opts, WithTimelineBroadcaster(i.TimelineBroadcaster))
+	}
 	if len(i.PersistentMemory) > 0 {
 		opts = append(opts, WithAppendPersistentContext(i.PersistentMemory...))
 	}
 
 	opts = append(opts, WithAllowRequireForUserInteract(i.AllowRequireForUserInteract))
+	if i.browserHTTPFlowIdentityResolver != nil {
+		opts = append(opts, WithBrowserHTTPFlowIdentityResolver(i.browserHTTPFlowIdentityResolver))
+	}
+	// Goal strategy itself is top-level only, but its no-blocking boundary must
+	// survive a handoff into a coordinator or another nested runtime.
+	opts = append(opts, func(c *Config) error {
+		c.disableBlockingClarification = i.disableBlockingClarification || i.EnableGoalMode
+		return nil
+	})
 
 	// aiCallback
 	if i.AiServerName != "" {
@@ -4400,7 +4416,7 @@ func convertConfigToOptions(i *Config, inheritHotPatch bool) []ConfigOption {
 
 	// Other boolean/flag options
 	opts = append(opts, WithAllowRequireForUserInteract(i.AllowRequireForUserInteract))
-	opts = append(opts, WithAllowPlanUserInteract(i.AllowPlanUserInteract))
+	opts = append(opts, WithAllowPlanUserInteract(i.AllowPlanUserInteract), WithPlanUserInteractMaxCount(i.PlanUserInteractMaxCount))
 	opts = append(opts, WithEnablePlanAndExec(i.EnablePlanAndExec))
 	opts = append(opts, WithEnableDetachedPlan(i.EnableDetachedPlan))
 	opts = append(opts, WithEnableSubagentsInPlan(i.EnableSubagentsInPlan))
@@ -4460,7 +4476,7 @@ func convertConfigToOptions(i *Config, inheritHotPatch bool) []ConfigOption {
 	opts = append(opts, WithPeriodicVerificationInterval(i.PeriodicVerificationInterval))
 
 	if i.PerTaskUserInteractiveLimitedTimes > 0 {
-		opts = append(opts, WithPerTaskUserInteractiveLimitedTimes(i.PerTaskUserInteractiveLimitedTimes))
+		opts = append(opts, WithPerTaskUserInteractiveLimitedTimes(i.PerTaskUserInteractiveLimitedTimes), func(c *Config) error { c.userInteractLimitExplicit = i.userInteractLimitExplicit; return nil })
 	}
 
 	// Timeline / memory limits

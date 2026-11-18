@@ -612,7 +612,9 @@ func skipCompileFile(exclude ssaconfig.CompileExcludeFunc, path string, info fs.
 	return exclude != nil && exclude(path)
 }
 
-// ScanProjectFiles scans the project directory and returns the files to be processed
+// ScanProjectFiles scans the project directory and returns the files to be processed.
+// Entry files select frontend roots, not scan inputs; retain non-entry files
+// for preprocessing and source lookup.
 func ScanProjectFiles(cfg ScanConfig) (*ScanResult, error) {
 	result := &ScanResult{
 		HandlerFiles:      make([]string, 0),

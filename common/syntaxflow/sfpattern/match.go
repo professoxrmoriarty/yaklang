@@ -57,21 +57,55 @@ func MatchRegexpWithNegatives(files map[string]string, pathPattern string, posit
 }
 
 func matchRegexpWithNegatives(root *sfvm.PatternRoot, pathPattern string, positive string, negatives []string) (sfvm.Values, error) {
+	// A negative-filtered result is a completed search: cache it, including a
+	// zero-hit result. The source executor replays a rule once per bounded hit
+	// window, so an uncached empty result rescans every file for every window.
+	// NotList keeps this entry apart from a plain union of the same expressions.
+	resultKey := sourceSearchKey(pathPattern, true, append([]string{positive}, negatives...))
+	kept, err := root.SourceHitsOrLoad(resultKey, func() ([]Hit, error) {
+		return filterNegativeHits(root, pathPattern, positive, negatives)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(kept) == 0 {
+		return nil, noNegativeMatchError(positive)
+	}
+	return sourceHitsToValues(root, kept)
+}
+
+// positiveHits returns the hits of one positive pattern, scanning at most once
+// while several callers wait. The plain search and the negative filter use the
+// same key, so a rule that mentions the pattern twice scans it once.
+func positiveHits(root *sfvm.PatternRoot, pathPattern string, patterns []string) ([]Hit, error) {
+	return root.SourceHitsOrLoad(sourceHitKey(pathPattern, patterns), func() ([]Hit, error) {
+		hits, _, err := scanRegexpHitsWithReason(root, pathPattern, patterns)
+		// A completed search is returned even when it is empty; the flight stores it.
+		return hits, err
+	})
+}
+
+// filterNegativeHits computes one pattern_regex_not result. It runs inside the
+// result key's flight, so concurrent windows share one positive scan and one
+// negative filter instead of repeating both.
+//
+// This is the only nested flight in the file: the result flight may enter the
+// positive flight, and no path enters the result key from inside the positive
+// one. The two keys are also distinct (NotList differs), so neither can wait
+// on itself.
+func filterNegativeHits(root *sfvm.PatternRoot, pathPattern string, positive string, negatives []string) ([]Hit, error) {
 	// Reuse the regular regexp cache for the positive set; then apply the
 	// negative filter ourselves. This avoids recomputing the (often large)
 	// positive hit list every time a pattern_regex_not statement runs.
-	positiveKey := sourceHitKey(pathPattern, []string{positive})
-	hits, cached := root.SourceHits(positiveKey)
-	if !cached {
-		var err error
-		hits, err = scanRegexpHits(root, pathPattern, []string{positive})
-		if err != nil {
-			return nil, err
-		}
-		root.SetSourceHits(positiveKey, hits)
+	hits, err := positiveHits(root, pathPattern, []string{positive})
+	if err != nil {
+		return nil, err
+	}
+	if len(hits) == 0 {
+		return nil, emptySearchError(root, pathPattern, []string{positive})
 	}
 	if len(negatives) == 0 {
-		return sourceHitsToValues(root, hits)
+		return hits, nil
 	}
 
 	negativeMatcher := compileContentMatchers(negatives)
@@ -81,7 +115,7 @@ func matchRegexpWithNegatives(root *sfvm.PatternRoot, pathPattern string, positi
 		byFile[h.Path] = append(byFile[h.Path], h)
 	}
 
-	var kept []Hit
+	var keptHits []Hit
 	for filePath, fileHits := range byFile {
 		content, err := root.FileContent(filePath)
 		if err != nil {
@@ -97,15 +131,15 @@ func matchRegexpWithNegatives(root *sfvm.PatternRoot, pathPattern string, positi
 				}
 			}
 			if !overlap {
-				kept = append(kept, h)
+				keptHits = append(keptHits, h)
 			}
 		}
 	}
-	if len(kept) == 0 {
-		return nil, utils.Errorf("no file contains data matching rule %v (after negative filter)", []string{positive})
-	}
-	root.SetSourceHits(sourceHitKey(pathPattern, append([]string{positive}, negatives...)), kept)
-	return sourceHitsToValues(root, kept)
+	return keptHits, nil
+}
+
+func noNegativeMatchError(positive string) error {
+	return utils.Errorf("no file contains data matching rule %v (after negative filter)", []string{positive})
 }
 
 // NewRoot builds a PatternRoot with files and registers the regexp matcher.
@@ -185,15 +219,12 @@ func MatchRegexp(files map[string]string, pathPattern string, patterns []string)
 }
 
 func matchRegexp(root *sfvm.PatternRoot, pathPattern string, patterns []string) (sfvm.Values, error) {
-	key := sourceHitKey(pathPattern, patterns)
-	hits, cached := root.SourceHits(key)
-	if !cached {
-		var err error
-		hits, err = scanRegexpHits(root, pathPattern, patterns)
-		if err != nil {
-			return nil, err
-		}
-		root.SetSourceHits(key, hits)
+	hits, err := positiveHits(root, pathPattern, patterns)
+	if err != nil {
+		return nil, err
+	}
+	if len(hits) == 0 {
+		return nil, emptySearchError(root, pathPattern, patterns)
 	}
 	return sourceHitsToValues(root, hits)
 }
@@ -230,7 +261,30 @@ func sourceHitsToValues(root *sfvm.PatternRoot, hits []Hit) (sfvm.Values, error)
 }
 
 func sourceHitKey(pathPattern string, patterns []string) string {
-	return pathPattern + "\x00" + strings.Join(patterns, "\x00")
+	return sourceSearchKey(pathPattern, false, patterns)
+}
+
+// emptySearchError repeats the reason a completed search found nothing. It is
+// used for a cached zero-hit entry so the second execution returns the same
+// error as the first instead of a successful empty value set.
+func emptySearchError(root *sfvm.PatternRoot, pathPattern string, patterns []string) error {
+	if matchedAnyPath(root, pathPattern) {
+		return utils.Errorf("no file contains data matching rule %v", patterns)
+	}
+	return utils.Errorf("no file matched by path %s", pathPattern)
+}
+
+func matchedAnyPath(root *sfvm.PatternRoot, pathPattern string) bool {
+	if root == nil {
+		return false
+	}
+	matchFile := compilePathMatcher(pathPattern)
+	for _, filePath := range root.FilePaths() {
+		if matchFile(filePath) {
+			return true
+		}
+	}
+	return false
 }
 
 // MatchRegexpHits returns raw hits (for tests / callers that skip ValueOperator).
@@ -239,17 +293,34 @@ func MatchRegexpHits(files map[string]string, pathPattern string, patterns []str
 }
 
 func scanRegexpHits(root *sfvm.PatternRoot, pathPattern string, patterns []string) ([]Hit, error) {
+	hits, matchedFile, err := scanRegexpHitsWithReason(root, pathPattern, patterns)
+	if err != nil {
+		return nil, err
+	}
+	if len(hits) == 0 {
+		if matchedFile {
+			return nil, utils.Errorf("no file contains data matching rule %v", patterns)
+		}
+		return nil, utils.Errorf("no file matched by path %s", pathPattern)
+	}
+	return hits, nil
+}
+
+// scanRegexpHitsWithReason separates a completed search from a failed one.
+// matchedFile reports whether at least one path passed the filter, so a caller
+// can cache the empty result and still repeat the original "no match" error.
+func scanRegexpHitsWithReason(root *sfvm.PatternRoot, pathPattern string, patterns []string) ([]Hit, bool, error) {
 	if pathPattern == "" {
-		return nil, utils.Error("sfpattern: empty path pattern")
+		return nil, false, utils.Error("sfpattern: empty path pattern")
 	}
 	matchFile := compilePathMatcher(pathPattern)
 	matchContent := compileContentMatchers(patterns)
 	if matchContent == nil {
-		return nil, utils.Error("sfpattern: no content patterns")
+		return nil, false, utils.Error("sfpattern: no content patterns")
 	}
 
 	if root == nil {
-		return nil, utils.Error("sfpattern: no source files")
+		return nil, false, utils.Error("sfpattern: no source files")
 	}
 	paths := root.FilePaths()
 	var hits []Hit
@@ -260,7 +331,7 @@ func scanRegexpHits(root *sfvm.PatternRoot, pathPattern string, patterns []strin
 		}
 		content, err := root.FileContent(filePath)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		matchedFile = true
 		for _, idx := range matchContent(content) {
@@ -275,23 +346,20 @@ func scanRegexpHits(root *sfvm.PatternRoot, pathPattern string, patterns []strin
 			})
 		}
 	}
-	if len(hits) == 0 {
-		if matchedFile {
-			return nil, utils.Errorf("no file contains data matching rule %v", patterns)
-		}
-		return nil, utils.Errorf("no file matched by path %s", pathPattern)
-	}
-	return hits, nil
+	return hits, matchedFile, nil
 }
 
 type byteIndex struct{ Start, End int }
 
 func compilePathMatcher(file string) func(string) bool {
+	if file == "*" || file == "*.*" {
+		// The blanket filter means "code and configuration", never a manifest:
+		// dependency entries are not findings, and only an explicit filter such
+		// as "*package.json" asks for one.
+		return func(s string) bool { return !blanketFileExcluded(s) }
+	}
 	var matchers []func(string) bool
 	matchers = append(matchers, func(s string) bool { return s == file })
-	if file == "*" || file == "*.*" {
-		matchers = append(matchers, func(string) bool { return true })
-	}
 	if strings.Contains(file, "*") {
 		if g, err := glob.Compile(file); err == nil {
 			matchers = append(matchers, func(s string) bool {

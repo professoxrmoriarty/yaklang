@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -34,11 +35,12 @@ type Session struct {
 	parentTaskID           string
 	planningOnly           bool
 	delivery               ResultDelivery
+	subForgeTools          []SubForgeTool
+	subForgeActive         atomic.Bool
 	externalLifecycle      bool
 	detached               bool
 	startTaskID            string
 	mu                     sync.Mutex
-	evidenceMu             sync.Mutex
 	last                   Snapshot
 	lastTree               json.RawMessage
 	opened, closed         map[string]bool
@@ -83,8 +85,11 @@ func NewSession(ctx context.Context, query string, opts ...aicommon.ConfigOption
 	}
 	s := &Session{Config: cfg, invoker: runtime, query: query, cancel: cancel, detached: cfg.EnableDetachedPlan, opened: map[string]bool{}, closed: map[string]bool{}, tasks: map[string]*aicommon.AIStatefulTaskBase{}}
 	for _, option := range cfg.OtherOption {
-		if d, ok := option.(deliveryOption); ok {
-			s.delivery = d.handler
+		switch option := option.(type) {
+		case deliveryOption:
+			s.delivery = option.handler
+		case subForgeToolsOption:
+			s.subForgeTools = option
 		}
 	}
 	cfg.Guardian.SetOutputEmitter(cfg.Id, cfg.EventHandler)
@@ -170,6 +175,10 @@ func fromRuntime(ctx context.Context, r aicommon.AIInvokeRuntime, task aicommon.
 	key := "coordinator-input-" + id
 	if !forge {
 		parent.InputEventManager.RegisterMirrorOfAIInputEvent(key, func(e *ypb.AIInputEvent) {
+			// The outer runtime validates and routes UI replies to their origin.
+			if e.GetUserInteraction() != "" || e.SyncType == aicommon.SyncUIInteraction {
+				return
+			}
 			switch e.SyncType {
 			case aicommon.SYNC_TYPE_USER_INTERVENTION, "queue_info", "react_cancel_task", "react_cancel_current_task":
 				// The outer runtime owns queue cancellation. Its context already
@@ -179,11 +188,15 @@ func fromRuntime(ctx context.Context, r aicommon.AIInvokeRuntime, task aicommon.
 			input.SafeFeed(e)
 		})
 	}
-	parent.InputEventManager.RegisterAfterInputEvent(key, func(e *ypb.AIInputEvent) {
-		if e.IsInteractiveMessage || e.SyncType == aicommon.SYNC_TYPE_USER_INTERVENTION {
-			s.notifyUserInput(e)
-		}
-	})
+	// A sub-Forge owns a private endpoint route. Observing every parent
+	// reply here would inject unrelated user revisions into its coordinator.
+	if !IsSubForgeContext(ctx) {
+		parent.InputEventManager.RegisterAfterInputEvent(key, func(e *ypb.AIInputEvent) {
+			if e.IsInteractiveMessage || e.SyncType == aicommon.SYNC_TYPE_USER_INTERVENTION {
+				s.notifyUserInput(e)
+			}
+		})
+	}
 	s.cleanup = func() {
 		if !forge {
 			parent.InputEventManager.UnregisterMirrorOfAIInputEvent(key)
@@ -308,6 +321,15 @@ func (s *Session) restore() error {
 	}
 	if err := resetCoordinatorRecovery(progress.State, s.startTaskID); err != nil {
 		return err
+	}
+	if len(s.subForgeTools) > 0 {
+		// A restored worker has a new attempt ID. Leave old checkpoints
+		// untouched and use their logical invocation identity for replay.
+		lastSeq, err := yakit.MaxCheckpointSequence(s.GetDB(), s.GetRuntimeId())
+		if err != nil {
+			return fmt.Errorf("restore checkpoint sequence: %w", err)
+		}
+		s.SeqIdProvider.AdvanceTo(max(lastSeq, s.Timeline.GetMaxID()))
 	}
 	if progress.State.Phase == PhaseExec {
 		s.detached = false
@@ -446,6 +468,9 @@ func (s *Session) Execute(ctx context.Context, a Attempt) (result Result, retErr
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	opts := aicommon.ConvertConfigToOptionsWithoutHotPatch(s.Config)
+	if IsSubForgeContext(ctx) {
+		opts = append(opts, aicommon.SubForgeExecutionPolicy(s.Config)...)
+	}
 	opts = append(opts, aicommon.WithEnhanceKnowledgeManager(s.EnhanceKnowledgeManager.ForkForSubAgent()))
 	if a.Plan != nil {
 		state := s.GetSessionPromptState().ForkForSubAgent()
@@ -488,11 +513,20 @@ func (s *Session) Execute(ctx context.Context, a Attempt) (result Result, retErr
 	}
 	aicommon.WithStatefulTaskBaseContext(ctx)(task)
 	task.SetName(a.Task.Name)
-	opts = append(opts, aicommon.WithDisableToolCallerIntervalReview(true), aicommon.WithContext(ctx), aicommon.WithID(s.Id), aicommon.WithAICallbacks(s.GetRawAICallbacks()), aicommon.WithEventInputChanx(input), aicommon.WithHotPatchOptionChan(hotpatch), aicommon.WithDisableCreateDBRuntime(true), aicommon.WithEnablePlanAndExec(false), aicommon.WithEmitter(s.GetEmitter().PushEventProcesser(func(e *schema.AiOutputEvent) *schema.AiOutputEvent {
+	opts = append(opts, aicommon.WithAllowRequireForUserInteract(false), aicommon.WithDisableToolCallerIntervalReview(true), aicommon.WithContext(ctx), aicommon.WithID(s.Id), aicommon.WithAICallbacks(s.GetRawAICallbacks()), aicommon.WithEventInputChanx(input), aicommon.WithHotPatchOptionChan(hotpatch), aicommon.WithDisableCreateDBRuntime(true), aicommon.WithEnablePlanAndExec(false), aicommon.WithEmitter(s.GetEmitter().PushEventProcesser(func(e *schema.AiOutputEvent) *schema.AiOutputEvent {
 		e.TaskUUID = task.GetUUID()
 		e.TaskId = task.GetId()
 		return e
 	})))
+	var subForgeDescriptions []string
+	if len(s.subForgeTools) > 0 && !s.IsToolUseDisabled() {
+		manager, descriptions, err := s.subForgeWorkerManager(task)
+		if err != nil {
+			return result, err
+		}
+		subForgeDescriptions = descriptions
+		opts = append(opts, aicommon.WithInheritedAiToolManager(manager))
+	}
 	opts = append(opts, NativeOptions()...)
 	runtime, err := aicommon.AIRuntimeInvokerGetter(ctx, opts...)
 	if err != nil {
@@ -509,8 +543,8 @@ func (s *Session) Execute(ctx context.Context, a Attempt) (result Result, retErr
 	workerOptions := append(reactloops.BasicAICommonConfigOption(cfg), func(l *reactloops.ReActLoop) {
 		// session 相同，但每次任务尝试的结果记录必须独立。
 		l.Set("coordinator_worker_attempt", workerAttemptRef{TaskID: a.Task.ID, AttemptID: a.ID})
-		l.Set("coordinator_discovery_callback", func(id, content string) error {
-			return s.saveTaskDiscovery(a, id, content)
+		l.Set("coordinator_discovery_callback", func(id string) error {
+			return s.notifyTaskDiscovery(a, id)
 		})
 	})
 	brief, _ := json.Marshal(map[string]any{"task_id": a.Task.ID, "attempt_id": a.ID, "name": a.Task.Name, "goal": a.Task.Goal, "accepted_predecessors": taskResultRecords(a.Predecessors), "unaccepted_prior_results": taskResultRecords(a.PriorResults)})
@@ -525,6 +559,9 @@ func (s *Session) Execute(ctx context.Context, a Attempt) (result Result, retErr
 		role, err := utils.RenderTemplate(workerInstruction, map[string]any{"FunctionCallMode": l.FunctionCallModeEnabled()})
 		if err != nil {
 			return "", err
+		}
+		if len(subForgeDescriptions) > 0 {
+			role += "\n[DECLARED_SUB_FORGES]\nCall the appropriate sub-Forge as a tool if needed, then use its result and continue the task.\n" + strings.Join(subForgeDescriptions, "\n")
 		}
 		return role + "\n[CURRENT_EXECUTION]\n" + string(brief) + "\n本次任务书已冻结；基于直接前置的已验收结果执行并验证。历史初步结果仅供背景参考。", nil
 	})(loop)

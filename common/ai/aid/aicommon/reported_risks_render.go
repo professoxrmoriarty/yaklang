@@ -10,11 +10,6 @@ import (
 	"github.com/yaklang/yaklang/common/schema"
 )
 
-// reportedRisksTokenBudget is the maximum token budget for the rendered
-// "已报告漏洞清单" block. When the budget is exceeded, the oldest entries
-// are evicted first — same strategy as sessionEvidenceTokenBudget.
-const reportedRisksTokenBudget = 4000
-
 // ReportedRiskItem is a compact, serializable summary of a single risk that
 // has been persisted via cybersecurity-risk or any other risk-emitting tool.
 // It carries only the fields needed for AI dedup: target, type, parameter,
@@ -29,8 +24,8 @@ type ReportedRiskItem struct {
 	CreatedUnix int64  `json:"created_unix"`
 }
 
-// ReportedRiskStore is the session-level accumulator for reported risk
-// summaries. It is serialized to JSON in SessionPromptState.
+// ReportedRiskStore is the running session's shared deduplication ledger.
+// Prompt content comes from immutable Timeline entries, not this store.
 type ReportedRiskStore struct {
 	mu    sync.Mutex
 	Items []ReportedRiskItem `json:"items"`
@@ -104,6 +99,17 @@ func (s *ReportedRiskStore) AppendFromRisk(risk *schema.Risk) bool {
 	if s == nil || risk == nil {
 		return false
 	}
+	item := reportedRiskItemFromRisk(risk)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.hasRiskLocked(item.ID) {
+		return false
+	}
+	s.Items = append(s.Items, item)
+	return true
+}
+
+func reportedRiskItemFromRisk(risk *schema.Risk) ReportedRiskItem {
 	target := normalizeRiskTargetForSummary(risk.Url, risk.Host, risk.Port)
 	riskType := strings.TrimSpace(risk.RiskType)
 	parameter := strings.TrimSpace(risk.Parameter)
@@ -112,14 +118,7 @@ func (s *ReportedRiskStore) AppendFromRisk(risk *schema.Risk) bool {
 
 	id := computeReportedRiskID(target, riskType, parameter)
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, item := range s.Items {
-		if item.ID == id {
-			return false // duplicate, skip
-		}
-	}
-	s.Items = append(s.Items, ReportedRiskItem{
+	return ReportedRiskItem{
 		ID:          id,
 		Severity:    severity,
 		RiskType:    riskType,
@@ -127,47 +126,16 @@ func (s *ReportedRiskStore) AppendFromRisk(risk *schema.Risk) bool {
 		Parameter:   parameter,
 		Title:       title,
 		CreatedUnix: time.Now().Unix(),
-	})
-	return true
+	}
 }
 
-// Render produces the markdown block injected into the timeline-open prompt
-// section. The output includes a header with dedup instructions followed by
-// one line per risk. When the token budget is exceeded, the oldest items are
-// silently dropped from the rendered output (but remain in the store).
-func (s *ReportedRiskStore) Render() string {
-	if s == nil {
-		return ""
+func (s *ReportedRiskStore) hasRiskLocked(id string) bool {
+	for _, item := range s.Items {
+		if item.ID == id {
+			return true
+		}
 	}
-	s.mu.Lock()
-	items := make([]ReportedRiskItem, len(s.Items))
-	copy(items, s.Items)
-	s.mu.Unlock()
-	if len(items) == 0 {
-		return ""
-	}
-	return renderReportedRiskItems(items)
-}
-
-// renderReportedRiskItems renders a list of risk summaries as a compact
-// markdown block, trimming to token budget by evicting oldest entries.
-func renderReportedRiskItems(items []ReportedRiskItem) string {
-	header := "## 已报告漏洞清单（不要重复上报）\n" +
-		"以下漏洞已通过 `cybersecurity-risk` 上报到风险库。同一目标 + 同一漏洞类型 + 同一触发参数 = 同一漏洞，" +
-		"不要重复调用 `cybersecurity-risk`。如需补充新证据（如不同 payload 的回显），通过 evidence 沉淀，不再次上报。\n"
-
-	// Build lines newest-first for better visibility (latest findings on top).
-	lines := make([]string, 0, len(items))
-	for i := len(items) - 1; i >= 0; i-- {
-		lines = append(lines, formatReportedRiskLine(&items[i]))
-	}
-
-	// Trim to token budget: evict from the tail (oldest, since we reversed).
-	for MeasureTokens(header+strings.Join(lines, "\n")) > reportedRisksTokenBudget && len(lines) > 1 {
-		lines = lines[:len(lines)-1]
-	}
-
-	return header + strings.Join(lines, "\n")
+	return false
 }
 
 // formatReportedRiskLine renders a single risk as one compact line:

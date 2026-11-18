@@ -53,6 +53,7 @@ type AICallerConfigIf interface {
 	AppendRelatedRuntimeID(runtimeID string)
 	GetSessionEvidenceRendered() string
 	ApplySessionEvidenceOps(ops []EvidenceOperation)
+	BroadcastEvidence(op EvidenceOperation) error
 
 	// 全局 TODO List：维持在 SessionPromptState 中，loop prompt 与 verify 路径
 	// 共享同一份状态。详见 verification_todo_store.go / session_prompt_state.go.
@@ -74,13 +75,10 @@ type AICallerConfigIf interface {
 	// IsSingleAIModelMode reports whether single-model simple mode is enabled.
 	IsSingleAIModelMode() bool
 
-	// Reported risks: session-level "已报告漏洞清单" accumulator.
-	// AppendReportedRisk is called from toolcall_invoke.go FeedBacker when a
-	// json-risk message is emitted, adding a compact summary to the store.
-	// GetReportedRisksRendered returns the markdown block for prompt injection.
-	// GetReportedRisks / SetReportedRisks are for DB persistence.
+	// AppendReportedRisk broadcasts immutable Timeline reporting facts and
+	// deduplicates in the running session. Get/Set methods are legacy ledger
+	// accessors; prompts and session restore use the Timeline's existing path.
 	AppendReportedRisk(risk *schema.Risk) bool
-	GetReportedRisksRendered() string
 	GetReportedRisks() string
 	SetReportedRisks(json string)
 }

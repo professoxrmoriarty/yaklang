@@ -45,7 +45,8 @@ func lowHTTPFlowSourceType(source string) string {
 		return schema.HTTPFlow_SourceType_CRAWLER
 	// WebFuzzer（含序列）发出的流量仍归到插件来源。流量分析页按 source_type=scan 查询，
 	// 同时用 [WebFuzzer] tag 区分是不是 Fuzzer 发出的。
-	case "", "scan", "port-scan", "plugin", "webfuzzer":
+	// AI Fuzz 的 History 和发包详情也使用 scan 来源查询。
+	case "", "scan", "port-scan", "plugin", "webfuzzer", "reactloop_http_fuzztest":
 		return schema.HTTPFlow_SourceType_SCAN
 	default:
 		return source
@@ -73,6 +74,10 @@ func SaveLowHTTPFlow(r *lowhttp.LowhttpResponse, forceSaveFlowSync bool) {
 	// WebFuzzer（含序列）发出的流量统一打上系统 Tag，便于从数据库按 [WebFuzzer] 筛选
 	if strings.EqualFold(reqSource, "webfuzzer") {
 		r.Tags = append(r.Tags, HTTPFlowTagWebFuzzer)
+		tags = r.Tags
+	}
+	if identity, ok := httpctx.GetBrowserInstance(r.RequestInstance); ok {
+		r.Tags = AppendBrowserInstanceHTTPFlowTags(r.Tags, identity)
 		tags = r.Tags
 	}
 	if r.HiddenIndex == "" {
@@ -898,7 +903,24 @@ func UpdateHTTPFlowTags(db *gorm.DB, i *schema.HTTPFlow) (finErr error) {
 	return nil
 }
 
-func InsertHTTPFlow(db *gorm.DB, i *schema.HTTPFlow) (fErr error) {
+func InsertHTTPFlow(db *gorm.DB, i *schema.HTTPFlow) error {
+	return insertHTTPFlow(db, i, nil)
+}
+
+func InsertHTTPFlowObserved(db *gorm.DB, i *schema.HTTPFlow, observe HTTPFlowWriteObserver) error {
+	observe.notify(HTTPFlowWriteSubmitting, 0, nil)
+	return insertHTTPFlow(db, i, observe)
+}
+
+func insertHTTPFlow(db *gorm.DB, i *schema.HTTPFlow, observe HTTPFlowWriteObserver) (fErr error) {
+	committed := false
+	if observe != nil {
+		defer func() {
+			if !committed {
+				observe.notify(HTTPFlowWriteFinished, 0, fErr)
+			}
+		}()
+	}
 	defer func() {
 		if err := recover(); err != nil {
 			fErr = utils.Errorf("met panic error: %v", err)
@@ -928,9 +950,12 @@ func InsertHTTPFlow(db *gorm.DB, i *schema.HTTPFlow) (fErr error) {
 	if i.PathSuffix == "" && i.Path != "" {
 		i.PathSuffix = lowhttp.GetPathSuffix(i.Path)
 	}
+	observe.notify(HTTPFlowWriteStarted, 0, nil)
 	if db = createHTTPFlowRecord(db, i); db.Error != nil {
-		return utils.Errorf("insert HTTPFlow failed: %s", db.Error)
+		return utils.Errorf("insert HTTPFlow failed: %w", db.Error)
 	}
+	committed = true
+	observe.notify(HTTPFlowWriteFinished, i.ID, nil)
 	if timing := i.RuntimeTiming; timing != nil {
 		timing.PersistedAtUnixMs = time.Now().UnixMilli()
 		RecordHTTPFlowPersisted(i)
@@ -994,10 +1019,19 @@ func CreateOrUpdateHTTPFlow(db *gorm.DB, hash string, i *schema.HTTPFlow) (fErr 
 }
 
 func SaveHTTPFlow(db *gorm.DB, i *schema.HTTPFlow) error {
+	return saveHTTPFlow(db, i, nil)
+}
+
+func saveHTTPFlow(db *gorm.DB, i *schema.HTTPFlow, observe HTTPFlowWriteObserver) error {
 	defer releaseHTTPFlowPersistResources(i)
-	if db := db.Model(&schema.HTTPFlow{}).Save(i); db.Error != nil {
-		return db.Error
+	observe.notify(HTTPFlowWriteSubmitting, 0, nil)
+	observe.notify(HTTPFlowWriteStarted, 0, nil)
+	result := db.Model(&schema.HTTPFlow{}).Save(i)
+	if result.Error != nil {
+		observe.notify(HTTPFlowWriteFinished, 0, result.Error)
+		return result.Error
 	}
+	observe.notify(HTTPFlowWriteFinished, i.ID, nil)
 	callHTTPFlowAfterSaveHandlers(i)
 
 	return nil
@@ -1061,14 +1095,19 @@ func UpdateHTTPFlowTagsEx(i *schema.HTTPFlow) error {
 }
 
 func InsertHTTPFlowEx(i *schema.HTTPFlow, forceSync bool, finishHandler ...func()) error {
+	return InsertHTTPFlowExObserved(i, forceSync, nil, finishHandler...)
+}
+
+func InsertHTTPFlowExObserved(i *schema.HTTPFlow, forceSync bool, observe HTTPFlowWriteObserver, finishHandler ...func()) error {
 	binding := consts.CaptureProjectDatabaseBinding()
 	if i != nil && i.RuntimeTiming != nil {
 		i.RuntimeTiming.PersistEnqueuedAtUnixMs = time.Now().UnixMilli()
 		i.RuntimeTiming.DatabaseIdentity = HTTPFlowDatabaseIdentity(binding.Path)
 		i.RuntimeTiming.ProjectGeneration = binding.Generation
 	}
-	if consts.GLOBAL_DB_SAVE_SYNC.IsSet() || forceSync {
-		err := InsertHTTPFlow(binding.Database, i)
+	observe.notify(HTTPFlowWriteSubmitting, 0, nil)
+	write := func(db *gorm.DB) error {
+		err := insertHTTPFlow(db, i, observe)
 		if err != nil {
 			cleanupDiscardedHTTPFlowRequestResources(i)
 			return err
@@ -1077,23 +1116,21 @@ func InsertHTTPFlowEx(i *schema.HTTPFlow, forceSync bool, finishHandler ...func(
 			h()
 		}
 		return nil
-	} else {
-		err := enqueueDBSaveTo(binding.Database, func(db *gorm.DB) error {
-			err := InsertHTTPFlow(db, i)
-			if err != nil {
-				cleanupDiscardedHTTPFlowRequestResources(i)
-				return err
-			}
-			for _, h := range finishHandler {
-				h()
-			}
-			return nil
-		})
-		if err != nil {
-			cleanupDiscardedHTTPFlowRequestResources(i)
-		}
+	}
+	if consts.GLOBAL_DB_SAVE_SYNC.IsSet() || forceSync {
+		return write(binding.Database)
+	}
+	if observe == nil {
+		return enqueueDBSaveTo(binding.Database, write)
+	}
+	if binding.Database == nil {
+		err := utils.Error("cannot execute async database save without a project database")
+		observe.notify(HTTPFlowWriteFinished, 0, err)
+		cleanupDiscardedHTTPFlowRequestResources(i)
 		return err
 	}
+	enqueueObservedHTTPFlowWrite(DBSaveAsyncChannel, bindDBSaveFunc(binding.Database, write), observe)
+	return nil
 }
 
 func CreateOrUpdateHTTPFlowExg(hash string, i *schema.HTTPFlow) error {
@@ -1411,7 +1448,12 @@ func FilterHTTPFlow(db *gorm.DB, params *ypb.QueryHTTPFlowRequest) *gorm.DB {
 		db = db.Where("is_websocket = true")
 	}
 
-	db = bizhelper.ExactQueryStringArrayOr(db, "source_type", utils.PrettifyListFromStringSplited(params.SourceType, ","))
+	sourceTypes := utils.PrettifyListFromStringSplited(params.SourceType, ",")
+	// Include AI Fuzz flows saved before their source was normalized to scan.
+	if lo.Contains(sourceTypes, schema.HTTPFlow_SourceType_SCAN) {
+		sourceTypes = append(sourceTypes, "reactloop_http_fuzztest")
+	}
+	db = bizhelper.ExactQueryStringArrayOr(db, "source_type", sourceTypes)
 	// 过滤 Methods
 	if ms := utils.StringArrayFilterEmpty(utils.PrettifyListFromStringSplited(params.GetMethods(), ",")); ms != nil {
 		db = bizhelper.ExactQueryStringArrayOr(db, "method", ms)

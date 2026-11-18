@@ -416,6 +416,17 @@ func (s *Server) MITMV2(stream ypb.Yak_MITMV2Server) error {
 	streamCtx, cancel := context.WithCancel(stream.Context())
 	defer cancel()
 	pipelineTracker := newMITMPipelineTracker(ksuid.New().String())
+	s.mitmDiagnostics.Store(pipelineTracker.sessionID, pipelineTracker)
+	releaseDiagnostics := func() {
+		s.mitmDiagnostics.Delete(pipelineTracker.sessionID)
+		pipelineTracker.close()
+	}
+	stopDiagnosticsCleanup := context.AfterFunc(streamCtx, releaseDiagnostics)
+	defer func() {
+		if stopDiagnosticsCleanup() {
+			releaseDiagnostics()
+		}
+	}()
 
 	log.Infof("start to create mitm server instance for %v", addr)
 
@@ -917,7 +928,7 @@ func (s *Server) MITMV2(stream ypb.Yak_MITMV2Server) error {
 	}
 
 	handleHijackResponse := func(isHttps bool, req *http.Request, rspInstance *http.Response, rsp []byte, remoteAddr string) (hijackRsp []byte) {
-		pipelineTracker.upstreamCompleted(req, httpctx.GetUpstreamRoundTripSucceeded(req))
+		pipelineTracker.upstreamCompleted(req, httpctx.GetUpstreamRoundTripSucceeded(req), rspInstance.StatusCode)
 		pluginCtx := httpctx.GetPluginContext(req)
 		urlStr := httpctx.GetRequestURL(req)
 
@@ -1256,7 +1267,7 @@ func (s *Server) MITMV2(stream ypb.Yak_MITMV2Server) error {
 	}
 
 	handleHijackRequest := func(isHttps bool, originReqIns *http.Request, req []byte) (hijackReq []byte) {
-		pipelineTracker.requestObserved(originReqIns)
+		pipelineTracker.requestObserved(originReqIns, filterWebSocket.IsSet())
 		defer func() {
 			if hijackReq == nil || httpctx.GetContextBoolInfoFromRequest(originReqIns, httpctx.REQUEST_CONTEXT_KEY_IsDropped) {
 				pipelineTracker.requestDropped(originReqIns)
@@ -1283,11 +1294,16 @@ func (s *Server) MITMV2(stream ypb.Yak_MITMV2Server) error {
 		var urlPath string
 		httpctx.SetResponseContentTypeFiltered(originReqIns, func(t string) bool {
 			ret := !filterManager.IsMIMEPassed(t)
+			decision := mitmFilterResponseExcluded
 			// 这里仅做“强路径”的提前过滤：避免影响普通 JS（弱路径由后续镜像阶段结合更多信号判定）。
 			if filterBundledStaticJS.IsSet() && isJavaScriptMIME(t) && isBundledJavaScriptStrongPath(strings.ToLower(urlPath)) {
 				ret = true
+				decision = mitmFilterStaticJSExcluded
 			}
 			httpctx.SetContextValueInfoFromRequest(originReqIns, httpctx.RESPONSE_CONTEXT_KEY_ResponseIsFiltered, ret)
+			if ret {
+				pipelineTracker.observeFilterExclusion(originReqIns, decision)
+			}
 			return ret
 		})
 
@@ -1329,6 +1345,7 @@ func (s *Server) MITMV2(stream ypb.Yak_MITMV2Server) error {
 		// 过滤
 		if !filterManager.IsPassed(method, hostname, urlStr, extName) {
 			httpctx.SetContextValueInfoFromRequest(originReqIns, httpctx.REQUEST_CONTEXT_KEY_RequestIsFiltered, true)
+			pipelineTracker.observeFilterExclusion(originReqIns, mitmFilterRequestExcluded)
 			return req
 		}
 
@@ -1472,6 +1489,9 @@ func (s *Server) MITMV2(stream ypb.Yak_MITMV2Server) error {
 		httpctx.SetResponseContentTypeFiltered(originReqIns, func(t string) bool { // update callback set resp filter feedback
 			ret := !filterManager.IsMIMEPassed(t)
 			httpctx.SetContextValueInfoFromRequest(originReqIns, httpctx.RESPONSE_CONTEXT_KEY_ResponseIsFiltered, ret)
+			if ret {
+				pipelineTracker.observeFilterExclusion(originReqIns, mitmFilterResponseExcluded)
+			}
 			if ret && httpctx.GetContextBoolInfoFromRequest(originReqIns, httpctx.RESPONSE_CONTEXT_KEY_ShouldBeHijackedFromRequest) {
 				hijackListFeedback(Hijack_List_Delete, taskInfo)
 				hijackManger.unRegister(task.taskID)
@@ -1593,12 +1613,11 @@ func (s *Server) MITMV2(stream ypb.Yak_MITMV2Server) error {
 						FlowBuiltAtUnixMs:     time.Now().UnixMilli(),
 					}
 					pipelineTracker.flowBuilt()
-					pipelineTracker.persistEnqueued(flow)
 					persisted := false
 					for i := 0; i < 3; i++ {
 						startCreateFlow = time.Now()
 						// 用户丢弃请求后，这个flow表现在http history中应该是不包含响应的
-						insertErr := yakit.InsertHTTPFlow(s.GetProjectDatabase(), flow)
+						insertErr := yakit.InsertHTTPFlowObserved(s.GetProjectDatabase(), flow, pipelineTracker.writeObserver(originReqIns))
 						log.Debugf("insert http flow %v cost: %s", truncate(originReqIns.URL.String()), time.Now().Sub(startCreateFlow))
 						if insertErr != nil {
 							log.Errorf("create / save httpflow from mirror error: %s", insertErr)
@@ -1608,7 +1627,6 @@ func (s *Server) MITMV2(stream ypb.Yak_MITMV2Server) error {
 						persisted = true
 						break
 					}
-					pipelineTracker.persistFinished(flow, persisted)
 					if !persisted {
 						yakit.CleanupPreparedLargeHTTPFlowRequest(originReqIns)
 					}
@@ -1702,15 +1720,17 @@ func (s *Server) MITMV2(stream ypb.Yak_MITMV2Server) error {
 		if httpctx.IsFiltered(req) {
 			return nil, nil
 		}
-		return yakit.NewHTTPFlowStreamRecorder(s.GetProjectDatabase(), isHTTPS, req, rsp, headerBytes, sizeThreshold)
+		return yakit.NewHTTPFlowStreamRecorderObserved(s.GetProjectDatabase(), isHTTPS, req, rsp, headerBytes, sizeThreshold, func() yakit.HTTPFlowWriteObserver {
+			return pipelineTracker.writeObserver(req)
+		})
 	})
 
 	handleMirrorResponse := func(isHttps bool, reqUrl string, req *http.Request, rsp *http.Response, remoteAddr string) {
 		responseMirrorAtUnixMs := time.Now().UnixMilli()
 		// Filtered responses skip the response-hijack callback, so mirror is also
 		// the fallback terminal point for their upstream stage.
-		pipelineTracker.upstreamCompleted(req, httpctx.GetUpstreamRoundTripSucceeded(req))
-		pipelineTracker.responseMirrored(req)
+		upstreamSucceeded := httpctx.GetUpstreamRoundTripSucceeded(req)
+		pipelineTracker.upstreamCompleted(req, upstreamSucceeded, rsp.StatusCode)
 		defer pipelineTracker.responseProcessingFinished(req)
 		addCounter()
 
@@ -1720,7 +1740,8 @@ func (s *Server) MITMV2(stream ypb.Yak_MITMV2Server) error {
 		isRequestModified := httpctx.GetRequestIsModified(req)
 		isResponseModified := httpctx.GetResponseIsModified(req)
 		isResponseDropped := httpctx.GetContextBoolInfoFromRequest(req, httpctx.RESPONSE_CONTEXT_KEY_IsDropped)
-		isFiltered := isFilteredByResponse || isFilteredByRequest || (filterWebSocket.IsSet() && httpctx.GetIsWebWebsocketRequest(req))
+		isFilteredByWebSocket := filterWebSocket.IsSet() && httpctx.GetIsWebWebsocketRequest(req)
+		isFiltered := isFilteredByResponse || isFilteredByRequest || isFilteredByWebSocket
 		isViewed := httpctx.GetRequestViewedByUser(req) || httpctx.GetResponseViewedByUser(req)
 		isModified := isRequestModified || isResponseModified
 
@@ -1740,6 +1761,7 @@ func (s *Server) MITMV2(stream ypb.Yak_MITMV2Server) error {
 		}
 
 		// 默认过滤 chunk/static JS（避免误伤：综合 path/mime/缓存头/少量 body 特征判定）
+		isFilteredByStaticJS := false
 		if filterBundledStaticJS.IsSet() && rsp != nil {
 			urlPath := ""
 			if req != nil && req.URL != nil {
@@ -1769,8 +1791,24 @@ func (s *Server) MITMV2(stream ypb.Yak_MITMV2Server) error {
 				httpctx.SetContextValueInfoFromRequest(req, httpctx.RESPONSE_CONTEXT_KEY_ResponseIsFiltered, true)
 				isFilteredByResponse = true
 				isFiltered = true
+				isFilteredByStaticJS = true
 			}
 		}
+
+		filterDecision := mitmFilterPending
+		switch {
+		case isFilteredByRequest:
+			filterDecision = mitmFilterRequestExcluded
+		case isFilteredByWebSocket:
+			filterDecision = mitmFilterWebSocketExcluded
+		case isFilteredByStaticJS:
+			filterDecision = mitmFilterStaticJSExcluded
+		case isFilteredByResponse:
+			filterDecision = mitmFilterResponseExcluded
+		case upstreamSucceeded || httpctx.GetShouldMockResponse(req):
+			filterDecision = mitmFilterPassed
+		}
+		pipelineTracker.responseMirrored(req, filterDecision)
 
 		// 内置敏感信息检测(TrafficGuard): 在过滤判定之前无条件扫描(不受任何过滤策略影响)。
 		// 命中敏感信息、且本应被过滤的流量, 改以"插件流量"(source_type=scan + FromPlugin)形式保存到插件输出,
@@ -1931,9 +1969,6 @@ func (s *Server) MITMV2(stream ypb.Yak_MITMV2Server) error {
 		}
 		hijackedFlowMutex := new(sync.Mutex)
 		isDroppedSaveFlow := utils.NewBool(false)
-		flow.AfterPersistCleanups = append(flow.AfterPersistCleanups, func(saved *schema.HTTPFlow) {
-			pipelineTracker.persistFinished(saved, saved != nil && saved.ID > 0)
-		})
 		afterPersistCleanups := append([]func(*schema.HTTPFlow){}, flow.AfterPersistCleanups...)
 
 		pluginCh := make(chan struct{})
@@ -2025,7 +2060,6 @@ func (s *Server) MITMV2(stream ypb.Yak_MITMV2Server) error {
 			// A hijackSaveHTTPFlow plugin may replace the public flow model. Keep
 			// process-local diagnostics owned by the engine and out of plugin data.
 			flow.RuntimeTiming = runtimeTiming
-			pipelineTracker.persistEnqueued(flow)
 			// 额外添加用户手动设置的标签，确保其优先级最高
 			userTags := httpctx.GetFlowTags(req)
 			if len(userTags) > 0 {
@@ -2033,15 +2067,20 @@ func (s *Server) MITMV2(stream ypb.Yak_MITMV2Server) error {
 			}
 			// 内置高危凭证检测(TrafficGuard): 复用上面过滤前已扫描的 tgFindings, 标红并生成 Risk。
 			trafficguard.ApplyToFlow(s.GetProjectDatabase(), flow, tgFindings, plainRequest, plainResponse)
+			if identity, ok := httpctx.GetBrowserInstance(req); ok {
+				yakit.ApplyBrowserInstanceToHTTPFlow(flow, identity)
+			}
 			tags := flow.Tags
 			var err error
 			if recorder, ok := httpctx.GetResponseStreamRecorder(req).(*yakit.HTTPFlowStreamRecorder); ok {
-				err = recorder.Finalize(flow)
+				err = recorder.FinalizeObserved(flow, func() yakit.HTTPFlowWriteObserver {
+					return pipelineTracker.writeObserver(req)
+				})
 				if err == nil {
 					saveBarePacketHandler(flow.ID)
 				}
 			} else {
-				err = yakit.InsertHTTPFlowEx(flow, false, func() {
+				err = yakit.InsertHTTPFlowExObserved(flow, false, pipelineTracker.writeObserver(req), func() {
 					saveBarePacketHandler(flow.ID)
 				})
 			}
@@ -2167,6 +2206,9 @@ func (s *Server) MITMV2(stream ypb.Yak_MITMV2Server) error {
 	if firstReq.GetMaxContentLength() != 0 && firstReq.GetMaxContentLength() <= 10*1024*1024 {
 		opts = append(opts, crep.MITM_SetMaxContentLength(firstReq.GetMaxContentLength()))
 	}
+	browserIngressOption, browserIngressReady, browserIngressCleanup := s.prepareBrowserMITMIngress(streamCtx, addr, proxyUsername != "" && proxyPassword != "")
+	defer browserIngressCleanup()
+	opts = append(opts, browserIngressOption)
 	mServer, err = crep.NewMITMServer(opts...)
 	if err != nil {
 		log.Error(err)
@@ -2179,9 +2221,10 @@ func (s *Server) MITMV2(stream ypb.Yak_MITMV2Server) error {
 	recoverFilterAndReplacerSend()
 
 	sendPipelineStats := func() {
-		sendLogged(&ypb.MITMV2Response{
-			PipelineStats: pipelineTracker.snapshot(len(yakit.DBSaveAsyncChannel), cap(yakit.DBSaveAsyncChannel)),
-		})
+		stats := pipelineTracker.snapshot(len(yakit.DBSaveAsyncChannel), cap(yakit.DBSaveAsyncChannel), yakit.DBSaveTakenUnfinished())
+		if stats != nil {
+			sendLogged(&ypb.MITMV2Response{PipelineStats: stats})
+		}
 	}
 	sendPipelineStats()
 	go func() {
@@ -2202,6 +2245,7 @@ func (s *Server) MITMV2(stream ypb.Yak_MITMV2Server) error {
 		// Single-port path: unchanged behaviour.
 		log.Infof("start serve mitm server for %s", addr)
 		err = mServer.ServeWithListenedCallback(streamCtx, addr, func() {
+			browserIngressReady()
 			feedbackToUser("MITM 服务器已启动 / starting mitm server")
 		})
 		if err != nil {
@@ -2222,6 +2266,7 @@ func (s *Server) MITMV2(stream ypb.Yak_MITMV2Server) error {
 	// ServeWithMultipleAddresses deduplicates, binds all listeners, then
 	// routes every accepted connection into the single underlying proxy loop.
 	err = mServer.ServeWithMultipleAddresses(streamCtx, allAddrs, func() {
+		browserIngressReady()
 		feedbackToUser("MITM 服务器已启动 / starting mitm server")
 	})
 	if err != nil {

@@ -37,6 +37,7 @@ type Server struct {
 	_abandonedDatabase  *gorm.DB
 	reverseServer       *facades.FacadeServer
 	reverseServerMu     sync.Mutex
+	mitmDiagnostics     sync.Map // session ID -> *mitmPipelineTracker
 	profileDatabase     *gorm.DB
 	projectDatabase     *gorm.DB
 	projectReadDatabase *gorm.DB
@@ -242,6 +243,8 @@ func newServerEx(opts ...ServerOpts) (*Server, error) {
 			browser.SetActiveExtensionBridgeManager(manager)
 			if startErr := manager.Start(serverConfig.browserBridgePort); startErr != nil {
 				log.Warnf("start browser extension bridge failed: %v", startErr)
+			} else {
+				log.Infof("browser extension bridge listening at %s", manager.Snapshot().URL)
 			}
 		}
 	}

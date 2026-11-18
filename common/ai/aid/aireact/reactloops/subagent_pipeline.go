@@ -36,9 +36,10 @@ type PreparedSubAgent struct {
 	StartedAt time.Time
 	// runtimeErr 记录 prepare 期 timeline 构建失败的原因；此时 Invoker/Task
 	// 为 nil，阶段 2 直接按失败兜底，不再尝试构建 runtime。
-	runtimeErr    error
-	configOptions []aicommon.ConfigOption // captured with the timeline, before queueing
-	parentEmitter *aicommon.Emitter
+	runtimeErr     error
+	configOptions  []aicommon.ConfigOption // captured with the timeline, before queueing
+	parentEmitter  *aicommon.Emitter
+	notifyEvidence func(evidenceID string) error
 }
 
 // ExecutedSubAgent 是阶段 2（执行任务）的产物：一个已执行（或执行失败）的子
@@ -104,6 +105,18 @@ func prepareSubAgents(
 		return nil
 	}
 	parentTimeline := parentCfg.GetTimeline()
+	// Capture the notification callback on the owner thread. Evidence itself is
+	// delivered by Timeline broadcast; this callback only wakes enclosing loops.
+	var parentNotify func(evidenceID string) error
+	if opts.ParentLoop != nil {
+		parentNotify = opts.ParentLoop.notifyEvidence
+	}
+	notify := func(evidenceID string) error {
+		if parentNotify != nil {
+			return parentNotify(evidenceID)
+		}
+		return nil
+	}
 
 	prepared := make([]*PreparedSubAgent, 0, len(jobs))
 	for _, job := range jobs {
@@ -136,12 +149,13 @@ func prepareSubAgents(
 		}
 
 		prepared = append(prepared, &PreparedSubAgent{
-			Job:           job,
-			Timeline:      handle,
-			Release:       func() {},
-			StartedAt:     startedAt,
-			configOptions: snapshotSubAgentConfig(parentCfg, job.ContextMode),
-			parentEmitter: parentCfg.GetEmitter(),
+			Job:            job,
+			Timeline:       handle,
+			Release:        func() {},
+			StartedAt:      startedAt,
+			configOptions:  snapshotSubAgentConfig(parentCfg, job.ContextMode),
+			parentEmitter:  parentCfg.GetEmitter(),
+			notifyEvidence: notify,
 		})
 	}
 	return prepared
@@ -359,6 +373,15 @@ func executeSubAgent(prepared *PreparedSubAgent, opts SubAgentOptions) *Executed
 		if opt != nil {
 			opt(loop)
 		}
+	}
+	// Custom builders are sub-agents too. Set identity and the parent channel
+	// together so core actions use the same propagation rule in every child.
+	if !loop.IsSubAgent() {
+		loop.Set(SubAgentDepthLoopVar, 1)
+	}
+	loop.notifyEvidence = prepared.notifyEvidence
+	if opts.notifyEvidence != nil {
+		loop.notifyEvidence = opts.notifyEvidence
 	}
 	execErr := loop.ExecuteWithExistedTask(prepared.Task)
 
@@ -620,10 +643,10 @@ func elaborateGoal(
 		[]aitool.ToolOption{
 			aitool.WithStringParam("goal",
 				aitool.WithParam_Required(true),
-				aitool.WithParam_Description("Elaborated, self-contained task goal for the sub agent."),
+				aitool.WithParam_Description("补全后的子任务目标，包含独立执行所需的事实和约束。"),
 			),
 			aitool.WithStringParam("result_contract",
-				aitool.WithParam_Description("Optional acceptance criteria / output format for the sub agent result."),
+				aitool.WithParam_Description("子任务的交付、证据、验收标准和输出格式；无特殊要求可省略。"),
 			),
 		},
 		// The prepared child snapshot is already in prompt. Never add a second
@@ -846,7 +869,7 @@ func buildUserInput(goal, resultContract string) string {
 	var sb strings.Builder
 	sb.WriteString(goal)
 	if contract := strings.TrimSpace(resultContract); contract != "" {
-		sb.WriteString("\n\n## Result Contract\n\n")
+		sb.WriteString("\n\n## 交付与验收要求\n\n")
 		sb.WriteString(contract)
 	}
 	return sb.String()
@@ -893,6 +916,7 @@ type SubAgentOptions struct {
 	taskReady      func(aicommon.AIStatefulTask)
 	observeEvent   func(*schema.AiOutputEvent)
 	resultWriter   func(id, content string) (string, error)
+	notifyEvidence func(evidenceID string) error
 	// TimelineMode 决定子 Agent 的 timeline 容器。默认 SubAgentTimelineFork。
 	TimelineMode SubAgentTimelineMode
 

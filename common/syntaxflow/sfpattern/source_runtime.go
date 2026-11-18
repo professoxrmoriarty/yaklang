@@ -35,11 +35,17 @@ type sourcePattern struct {
 	captures bool // legacy single-pattern searches also expose capture ranges
 }
 
+func isBlanketPath(expr string) bool {
+	return expr == "*" || expr == "*.*"
+}
+
 type sourceSearch struct {
 	path      string
 	positive  []int
 	negative  []int
 	matchPath func(string) bool
+	// lang is the file ceiling of a blanket search ("" means no ceiling).
+	lang string
 }
 
 // SourceScanStats describes the work shared by all rules on one source snapshot.
@@ -52,7 +58,12 @@ type SourceScanStats struct {
 	Bytes         int64
 	Hits          int
 	FallbackFiles int
-	Lookups       int64
+	// DegradedPatterns counts (file, pattern) pairs skipped because PCRE2
+	// exceeded its backtracking match or depth budget. The file still
+	// publishes every other pattern's hits; the skipped pair contributes no
+	// hits rather than aborting the scan.
+	DegradedPatterns int
+	Lookups          int64
 }
 
 // NewSourceScanPlan collects every named OpFileFilterReg, not just the first
@@ -61,16 +72,33 @@ type SourceScanStats struct {
 func NewSourceScanPlan(frames []*sfvm.SFFrame) (*SourceScanPlan, error) {
 	p := &SourceScanPlan{searches: make(map[string]sourceSearch)}
 	ids := make(map[sourcePattern]int)
+	// One search key can be shared by rules of different languages. When that
+	// happens the ceiling must widen, never narrow: a shared search keeps the
+	// no-ceiling behavior of the general rule.
+	seenLanguage := make(map[string]string)
+	languageConflict := make(map[string]bool)
 	for _, frame := range frames {
 		if !sfvm.FrameIsSourceMode(frame) {
 			continue
+		}
+		language := ""
+		if rule := frame.GetRule(); rule != nil {
+			language = normalizeSourceLanguage(string(rule.Language))
 		}
 		for _, code := range frame.Codes {
 			if code.OpCode != sfvm.OpFileFilterReg || code.UnaryStr == "" {
 				continue
 			}
 			key := directSearchKey(code.UnaryStr, code.FileFilterMethodItem, code.Values)
-			if _, ok := p.searches[key]; ok {
+			if existing, ok := p.searches[key]; ok {
+				if isBlanketPath(code.UnaryStr) && !languageConflict[key] {
+					if seen := seenLanguage[key]; seen != language {
+						languageConflict[key] = true
+						existing.lang = ""
+						existing.matchPath = compilePathMatcher(existing.path)
+						p.searches[key] = existing
+					}
+				}
 				continue
 			}
 			positive, negative := code.Values, []string(nil)
@@ -110,10 +138,19 @@ func NewSourceScanPlan(frames []*sfvm.SFFrame) (*SourceScanPlan, error) {
 				}
 				return out
 			}
-			p.searches[key] = sourceSearch{
+			search := sourceSearch{
 				path: code.UnaryStr, positive: add(positive), negative: add(negative),
 				matchPath: compilePathMatcher(code.UnaryStr),
 			}
+			if isBlanketPath(code.UnaryStr) && language != "" {
+				search.lang = language
+				base := search.matchPath
+				search.matchPath = func(path string) bool {
+					return base(path) && languageAllowsPath(language, path)
+				}
+			}
+			seenLanguage[key] = language
+			p.searches[key] = search
 		}
 	}
 	if len(p.patterns) == 0 {
@@ -146,14 +183,10 @@ func cleanPatterns(patterns []string) []string {
 
 func usablePatterns(patterns []string) bool {
 	for _, expr := range patterns {
-		// The legacy multi-pattern helper omits PCRE2 existence-only entries.
-		// Keep those uncommon calls on that path rather than changing their
-		// capture/negative-filter semantics as part of a performance change.
-		if len(patterns) >= 2 {
-			if _, err := regexp.Compile(expr); err != nil {
-				return false
-			}
-		}
+		// Go's regexp rejects lookaround, backrefs and \Z, but the PCRE2 engine
+		// in regexp-utils accepts them. The pre-scan locates such a match with
+		// the same locator the legacy path used, so keep the whole search in the
+		// plan instead of rescanning it file by file outside the shared scan.
 		if !regexp_utils.NewYakRegexpUtils(expr).CanUse() {
 			return false
 		}
@@ -162,13 +195,18 @@ func usablePatterns(patterns []string) bool {
 }
 
 func directSearchKey(path string, params map[string]string, patterns []string) string {
-	// Length-safe encoding: patterns can themselves contain NULs. Negative
-	// and ordinary calls with identical arguments must not share a result.
+	return sourceSearchKey(path, sfvm.FileFilterParamOn(params, sfvm.FileFilterParamPatternNotList), patterns)
+}
+
+// sourceSearchKey identifies one content search. NotList keeps a
+// negative-filtered result apart from a plain union of the same expressions:
+// they hold different hits and must never share a cache entry.
+func sourceSearchKey(path string, notList bool, patterns []string) string {
 	key, _ := json.Marshal(struct {
 		Path     string
 		Patterns []string
 		NotList  bool
-	}{path, patterns, sfvm.FileFilterParamOn(params, sfvm.FileFilterParamPatternNotList)})
+	}{path, patterns, notList})
 	return string(key)
 }
 
@@ -530,11 +568,19 @@ func (r *SourceScanRuntime) scanFile(ctx context.Context, scratch minirehs.Scrat
 				return nil, false, err
 			}
 			var locatedHits []byteIndex
-			locatedHits, err = locateContent(locator, content, r.plan.patterns[id].captures)
-			fileHits[id] = ownSpans(content, locatedHits)
-			if err != nil {
-				return nil, false, fmt.Errorf("source pre-scan %s pattern %d: %w", path, id, err)
+			locatedHits, locateErr = locateContent(locator, content, r.plan.patterns[id].captures)
+			if locateErr != nil {
+				// One pattern exhausting PCRE2's budget is a property of that
+				// pattern on this file, not of the scan. Skipping it keeps the
+				// other patterns' hits; failing here used to abort the whole
+				// project scan after every rule had already finished.
+				if minirehs.IsExecutionLimit(locateErr) {
+					r.recordDegraded(path, id, locateErr)
+					continue
+				}
+				return nil, false, fmt.Errorf("source pre-scan %s pattern %d: %w", path, id, locateErr)
 			}
+			fileHits[id] = ownSpans(content, locatedHits)
 		}
 		return fileHits, true, nil
 	}
@@ -554,6 +600,16 @@ func ownSpans(content string, spans []byteIndex) []storedSpan {
 		out[i] = ownSpan(content, span.Start, span.End)
 	}
 	return out
+}
+
+// recordDegraded keeps the degradation observable without failing the scan.
+// The pattern keeps its hits on other files; this file simply contributes none
+// for it.
+func (r *SourceScanRuntime) recordDegraded(path string, pattern int, err error) {
+	r.mu.Lock()
+	r.stats.DegradedPatterns++
+	r.mu.Unlock()
+	log.Warnf("source pre-scan: skip %s pattern %d: %v", path, pattern, err)
 }
 
 func (r *SourceScanRuntime) publish(path string, size int, fileHits [][]storedSpan, fallback bool) {
@@ -725,8 +781,13 @@ func (r *SourceScanRuntime) Matcher(ctx context.Context) sfvm.FileFilterFunc {
 			root.SetSourceHits(cacheKey, hits)
 		}
 		if len(hits) == 0 {
-			matchedFile := false
+			// A blanket filter matches by definition; it only skips manifests,
+			// and a manifest-only store is not a broken filter.
+			matchedFile := search.path == "*" || search.path == "*.*"
 			for _, path := range r.store.Paths() {
+				if matchedFile {
+					break
+				}
 				if search.matchPath(path) {
 					matchedFile = true
 					break

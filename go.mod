@@ -101,11 +101,11 @@ require (
 	github.com/xdg-go/stringprep v1.0.4
 	github.com/xuri/excelize/v2 v2.9.0
 	github.com/yaklang/fastgocaptcha v1.1.0
-	github.com/yaklang/go-llvm v0.0.0-20260713075540-46cdfea08f33
+	github.com/yaklang/go-llvm v0.0.0-20261110094028-e7fe69236a2f
 	// Yaklang's maintained hard fork combines goja and goja_nodejs in one Go 1.22 module.
 	github.com/yaklang/goja v0.1.0
 	github.com/yaklang/gorm v1.9.18-0.20261027075104-00c777df9a43
-	github.com/yaklang/javajive v0.7.1-0.20261103025322-66a7a6e68cc4
+	github.com/yaklang/javajive v0.8.0
 	github.com/yaklang/pcap v1.0.7-0.20261013042911-fa4332334a4a
 	github.com/ysmood/gson v0.7.3
 	github.com/ysmood/leakless v0.9.0
@@ -184,7 +184,7 @@ require (
 	github.com/xanzy/ssh-agent v0.3.3 // indirect
 	github.com/xuri/efp v0.0.0-20240408161823-9ad904a10d6d // indirect
 	github.com/xuri/nfp v0.0.0-20240318013403-ab9948c2c4a7 // indirect
-	github.com/yaklang/antlr/v4 v4.0.0-20260713034513-d8e6ed6334bf
+	github.com/yaklang/antlr/v4 v4.0.0
 	github.com/yaklang/gorm/dm v0.0.0-20261027074109-c09736ed36a6 // indirect
 	github.com/ysmood/fetchup v0.2.3 // indirect
 	github.com/ysmood/goob v0.4.0 // indirect

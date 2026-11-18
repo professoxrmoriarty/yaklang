@@ -361,10 +361,12 @@ github.com/xuri/nfp v0.0.0-20240318013403-ab9948c2c4a7 h1:hPVCafDV85blFTabnqKgNh
 github.com/xuri/nfp v0.0.0-20240318013403-ab9948c2c4a7/go.mod h1:WwHg+CVyzlv/TX9xqBFXEZAuxOPxn2k1GNHwG41IIUQ=
 github.com/yaklang/antlr/v4 v4.0.0-20260713034513-d8e6ed6334bf h1:RJjNj12ALCgULQCvivvlUpgOSnek7ftvurWMaY/9sBg=
 github.com/yaklang/antlr/v4 v4.0.0-20260713034513-d8e6ed6334bf/go.mod h1:Iy/qj07Ec2kcOY9OhdclyPd0IieCSf4ZkzwhKSXPBn8=
+github.com/yaklang/antlr/v4 v4.0.0 h1:y5J9OcYZN8Kg/PP0z/V6x6tVo2GofC+x/4G+Af2FPp8=
+github.com/yaklang/antlr/v4 v4.0.0/go.mod h1:Iy/qj07Ec2kcOY9OhdclyPd0IieCSf4ZkzwhKSXPBn8=
 github.com/yaklang/fastgocaptcha v1.1.0 h1:Q6aigWdM1hm71rU+iTe1n9Q6Xo8ubdBDEIbNVdebpbo=
 github.com/yaklang/fastgocaptcha v1.1.0/go.mod h1:fymGgV4ndLQHr+NZakv91Dlc2iri1fpeyzSKIPWsFlI=
-github.com/yaklang/go-llvm v0.0.0-20260713075540-46cdfea08f33 h1:1R6ppYeuBxDEoBqTfogfwT+fFe4X6RxIButkKr0pv+I=
-github.com/yaklang/go-llvm v0.0.0-20260713075540-46cdfea08f33/go.mod h1:L8gVgAxjSL0/ub973fygXVVHoDaYKLC190N6uq+o+tE=
+github.com/yaklang/go-llvm v0.0.0-20261110094028-e7fe69236a2f h1:+FJsotHoFZ9K1cBJ6X/stVsNMnnOIEFth7+yVQ1+Opo=
+github.com/yaklang/go-llvm v0.0.0-20261110094028-e7fe69236a2f/go.mod h1:L8gVgAxjSL0/ub973fygXVVHoDaYKLC190N6uq+o+tE=
 github.com/yaklang/go-sqlite3 v0.0.1 h1:IXdqvUAct8FygqoQ3XgWBqw8Bh7qQFa0miTl4cM4B+4=
 github.com/yaklang/go-sqlite3 v0.0.1/go.mod h1:RCLoOuANeSNMmFMCABJyusomiGXnZjkLk20oZSAAh5U=
 github.com/yaklang/go-sqlite3 v0.0.2 h1:PFp1aIHBKBA0Ss7i/NaVtB2eHbueRxWJI7QGSCNHgOk=
@@ -391,6 +393,8 @@ github.com/yaklang/javajive v0.4.1-0.20260920160508-81f8ef556034 h1:xEjfB8k9GPDz
 github.com/yaklang/javajive v0.4.1-0.20260920160508-81f8ef556034/go.mod h1:jBN6/F8NLkvK/H/wZMwPqwD6AofmO/vngIecz8qBkNo=
 github.com/yaklang/javajive v0.7.1-0.20261103025322-66a7a6e68cc4 h1:QnQiYQikgj6uq2LMuEmFMV78+RrBdNUwJI16snG+VaY=
 github.com/yaklang/javajive v0.7.1-0.20261103025322-66a7a6e68cc4/go.mod h1:jBN6/F8NLkvK/H/wZMwPqwD6AofmO/vngIecz8qBkNo=
+github.com/yaklang/javajive v0.8.0 h1:1fZoKGM0/sIV3CYpHtE0VsrQlPFKJqt1HmYZPY60hNM=
+github.com/yaklang/javajive v0.8.0/go.mod h1:W/Hnl/lXixDDqfGJQkXcb9FIYTMWP0SKtKvhQMrBPCU=
 github.com/yaklang/pcap v1.0.6-0.20260710032136-5f3df87eea80 h1:ZSw9udYCWovKLhUQhoNurjaEvX+HroS6il3hE3ulTC4=
 github.com/yaklang/pcap v1.0.6-0.20260710032136-5f3df87eea80/go.mod h1:JDglFyNaXnntS5KmdIVlhnZBAYFc0oEGPrmJlOI3MDg=
 github.com/yaklang/pcap v1.0.7-0.20261013042911-fa4332334a4a h1:slrwu0qOSR7hAbGpt0MDurG/ZkEPxT36MrUbiU8dEVI=
