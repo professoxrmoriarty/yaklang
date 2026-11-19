@@ -101,7 +101,7 @@ require (
 	github.com/xdg-go/stringprep v1.0.4
 	github.com/xuri/excelize/v2 v2.9.0
 	github.com/yaklang/fastgocaptcha v1.1.0
-	github.com/yaklang/go-llvm v0.0.0-20261110094028-e7fe69236a2f
+	github.com/yaklang/go-llvm v0.0.0-20261117100009-9cebf763572c
 	// Yaklang's maintained hard fork combines goja and goja_nodejs in one Go 1.22 module.
 	github.com/yaklang/goja v0.1.0
 	github.com/yaklang/gorm v1.9.18-0.20261027075104-00c777df9a43
@@ -135,6 +135,7 @@ require (
 	github.com/rogpeppe/go-internal v1.13.1 // indirect
 	github.com/vishvananda/netlink v1.1.1-0.20211118161826-650dca95af54 // indirect
 	go.opentelemetry.io/otel/sdk v1.32.0 // indirect
+	mvdan.cc/sh/v3 v3.10.0
 )
 
 require (
@@ -142,7 +143,7 @@ require (
 	github.com/ProtonMail/go-crypto v1.1.3 // indirect
 	github.com/VillanCh/go-pcre2-lite v0.1.6
 	github.com/andybalholm/cascadia v1.1.0 // indirect
-	github.com/creack/pty v1.1.21
+	github.com/creack/pty v1.1.23
 	github.com/cyphar/filepath-securejoin v0.2.5 // indirect
 	github.com/dop251/base64dec v0.0.0-20231022112746-c6c9f9a96217 // indirect
 	github.com/ebitengine/purego v0.9.1 // indirect
@@ -185,6 +186,9 @@ require (
 	github.com/xuri/efp v0.0.0-20240408161823-9ad904a10d6d // indirect
 	github.com/xuri/nfp v0.0.0-20240318013403-ab9948c2c4a7 // indirect
 	github.com/yaklang/antlr/v4 v4.0.0
+	github.com/yaklang/go-llvm/native/darwin-arm64 v0.0.0-20261117094941-9e799b8110e1 // indirect
+	github.com/yaklang/go-llvm/native/linux-amd64 v0.0.0-20261117093357-b6b843bac29d // indirect
+	github.com/yaklang/go-llvm/native/windows-amd64 v0.0.0-20261117093357-b6b843bac29d // indirect
 	github.com/yaklang/gorm/dm v0.0.0-20261027074109-c09736ed36a6 // indirect
 	github.com/ysmood/fetchup v0.2.3 // indirect
 	github.com/ysmood/goob v0.4.0 // indirect
