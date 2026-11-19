@@ -3,14 +3,23 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"strconv"
+	"strings"
 	"text/tabwriter"
 
+	"github.com/google/uuid"
+	"github.com/yaklang/gorm"
+	"github.com/yaklang/yaklang/common/consts"
 	cli "github.com/yaklang/yaklang/common/urfavecli"
 	"github.com/yaklang/yaklang/common/yak/reify"
 	"github.com/yaklang/yaklang/common/yak/reify/core"
 	"github.com/yaklang/yaklang/common/yak/reify/core/lowirtext"
+	"github.com/yaklang/yaklang/common/yak/ssa"
+	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
+	"github.com/yaklang/yaklang/common/yak/ssaapi"
 )
 
 type commandEnv struct {
@@ -59,6 +68,17 @@ func newCLIApp(env *commandEnv) *cli.App {
 			Action:    env.check,
 		},
 		{
+			Name:      "strings",
+			Usage:     "Decode one string with the detected language model",
+			ArgsUsage: "<file>",
+			Flags: []cli.Flag{
+				jsonFlag(),
+				cli.StringFlag{Name: "at", Usage: "Address or symbol of the bytes (C) or descriptor (Go/Rust)"},
+				formatFlag(),
+			},
+			Action: env.strings,
+		},
+		{
 			Name:      "lift",
 			Usage:     "Decode a code region; --mode selects asm, lowir, ssair, source or all",
 			ArgsUsage: "<file>",
@@ -75,6 +95,44 @@ func newCLIApp(env *commandEnv) *cli.App {
 				formatFlag(),
 			},
 			Action: env.lift,
+		},
+		{
+			Name:      "save",
+			Usage:     "Lift a file to SSA and save the program to ssadb",
+			ArgsUsage: "<file>",
+			Flags: []cli.Flag{
+				cli.StringFlag{Name: "name", Usage: "ssadb program name (required)"},
+				cli.BoolFlag{Name: "replace", Usage: "Replace an existing program after the new program is fully built"},
+				cli.StringFlag{Name: "asm-syntax", Value: "intel", Usage: "Assembly syntax: intel or att"},
+				cli.StringFlag{Name: "func", Usage: "Select a function by symbol name"},
+				cli.StringFlag{Name: "section", Usage: "Section to lift when no address is given; empty lifts every region"},
+				cli.StringFlag{Name: "address", Usage: "Start virtual address or symbol name"},
+				cli.StringFlag{Name: "size", Usage: "Region size in bytes"},
+				cli.StringFlag{Name: "lowir-pass", Usage: "Comma-separated LowIR pass names"},
+				cli.StringFlag{Name: "ssa-pass", Usage: "Comma-separated SSA pass names"},
+				formatFlag(),
+			},
+			Action: env.save,
+		},
+		{
+			Name:      "audit",
+			Usage:     "Run a syntaxflow rule against a lifted file or a saved program",
+			ArgsUsage: "<file> <syntaxflow> | --program <name> <syntaxflow>",
+			Flags: []cli.Flag{
+				cli.StringFlag{Name: "program", Usage: "ssadb program name; omit it to audit a file"},
+				cli.StringFlag{Name: "db", Usage: "SSA database path for --program; empty uses the default YAKIT_HOME database"},
+				cli.StringFlag{Name: "rule", Usage: "SyntaxFlow rule text; alternatively pass it as the last argument"},
+				cli.StringFlag{Name: "asm-syntax", Value: "intel", Usage: "Assembly syntax: intel or att"},
+				cli.StringFlag{Name: "func", Usage: "Select a function by symbol name"},
+				cli.StringFlag{Name: "section", Usage: "Section to lift when no address is given; empty lifts every region"},
+				cli.StringFlag{Name: "address", Usage: "Start virtual address or symbol name"},
+				cli.StringFlag{Name: "size", Usage: "Region size in bytes"},
+				cli.StringFlag{Name: "lowir-pass", Usage: "Comma-separated LowIR pass names"},
+				cli.StringFlag{Name: "ssa-pass", Usage: "Comma-separated SSA pass names"},
+				formatFlag(),
+				jsonFlag(),
+			},
+			Action: env.audit,
 		},
 	}
 	for index := range app.Commands {
@@ -168,6 +226,7 @@ func (e *commandEnv) inspect(c *cli.Context) error {
 	fmt.Fprintf(&text, "Input: %q\nSize: %d bytes\nLoader: %s\nFormat: %s\n", artifact.Origin.Name, artifact.Origin.Size, artifact.Loader.Name(), artifact.Format)
 	fmt.Fprintf(&text, "Target: %s\n", targetSummary(artifact.Target))
 	fmt.Fprintf(&text, "Parser: %s\n", parserSummary(parser))
+	writeLanguage(&text, artifact.Language)
 	if image := artifact.Image; image != nil {
 		fmt.Fprintf(&text, "Object: %s\n", image.ObjectType)
 		if entry, present := image.EntryPoint(); present {
@@ -187,6 +246,78 @@ func (e *commandEnv) inspect(c *cli.Context) error {
 	}
 	_, err = io.Copy(e.stdout, &text)
 	return err
+}
+
+func (e *commandEnv) strings(c *cli.Context) error {
+	if c.NArg() != 1 {
+		return cli.NewExitError("strings requires exactly one file", 2)
+	}
+	if !c.IsSet("at") {
+		return cli.NewExitError("strings requires --at", 2)
+	}
+	var options []reify.Option
+	if c.IsSet("format") {
+		options = append(options, reify.WithFormat(c.String("format")))
+	}
+	artifact, _, err := reify.Inspect(e.ctx, c.Args().First(), options...)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = artifact.Close() }()
+	if artifact.Language == nil || artifact.Language.Strings == nil {
+		return cli.NewExitError("strings: this artifact has no string model", 1)
+	}
+	address, err := stringAddress(artifact, c.String("at"))
+	if err != nil {
+		return err
+	}
+	value, err := artifact.Language.Strings.Decode(artifact, address)
+	if err != nil {
+		return err
+	}
+	if c.Bool("json") {
+		return writeJSON(e.stdout, stringReport{Scope: "one string", Address: address,
+			Layout: artifact.Language.Strings.Layout, Encoding: artifact.Language.Strings.Encoding, Value: value})
+	}
+	var text bytes.Buffer
+	fmt.Fprintf(&text, "Scope: one string\n")
+	fmt.Fprintf(&text, "Input: %q\n", artifact.Origin.Name)
+	writeLanguage(&text, artifact.Language)
+	fmt.Fprintf(&text, "Address: 0x%x\n", address)
+	fmt.Fprintf(&text, "Value: %q\n", value)
+	_, err = io.Copy(e.stdout, &text)
+	return err
+}
+
+type stringReport struct {
+	Scope    string              `json:"scope"`
+	Address  uint64              `json:"address"`
+	Layout   core.StringLayout   `json:"layout"`
+	Encoding core.StringEncoding `json:"encoding"`
+	Value    string              `json:"value"`
+}
+
+func stringAddress(artifact *core.Artifact, text string) (uint64, error) {
+	if value, err := parseAddress(text); err == nil {
+		return value, nil
+	}
+	if artifact.Image != nil {
+		if entry, ok := artifact.Image.SymbolByName(text); ok && entry.Address != 0 && !entry.Imported {
+			return entry.Address, nil
+		}
+	}
+	return 0, cli.NewExitError(fmt.Sprintf("strings: unknown address %q", text), 2)
+}
+
+func parseAddress(text string) (uint64, error) {
+	text = strings.TrimSpace(text)
+	if strings.HasPrefix(text, "0x") || strings.HasPrefix(text, "0X") {
+		return strconv.ParseUint(text[2:], 16, 64)
+	}
+	if value, err := strconv.ParseUint(text, 10, 64); err == nil {
+		return value, nil
+	}
+	return strconv.ParseUint(text, 16, 64)
 }
 
 func (e *commandEnv) check(c *cli.Context) error {
@@ -218,21 +349,97 @@ func (e *commandEnv) check(c *cli.Context) error {
 	return err
 }
 
-func (e *commandEnv) lift(c *cli.Context) error {
+type auditReport struct {
+	Program string   `json:"program"`
+	Rule    string   `json:"rule"`
+	Result  string   `json:"result"`
+	Errors  []string `json:"errors,omitempty"`
+}
+
+// save lifts a binary into YakSSA on the ssadb write cache and keeps the
+// program under --name. It is the producer half of the audit loop; audit is the
+// consumer half.
+//
+// The lift writes to a staging program name. Only after the lift and the cache
+// flush succeed does the staging program replace --name in one transaction, so
+// a bad flag, unreadable file or lift failure leaves the old program intact.
+func (e *commandEnv) save(c *cli.Context) error {
 	if c.NArg() != 1 {
-		return cli.NewExitError("lift requires exactly one file", 2)
+		return cli.NewExitError("save requires exactly one file", 2)
 	}
-	mode, err := reify.ParseMode(c.String("mode"))
+	name := strings.TrimSpace(c.String("name"))
+	if name == "" {
+		return cli.NewExitError("save requires --name", 2)
+	}
+	replace := c.Bool("replace")
+	_, err := ssadb.GetProgram(name, "")
+	switch {
+	case err == nil:
+		if !replace {
+			return cli.NewExitError(fmt.Sprintf("program %q already exists (use --replace)", name), 2)
+		}
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		// A new name is fine. Finalize rechecks under the transaction.
+	case err != nil:
+		return fmt.Errorf("inspect program %q: %w", name, err)
+	}
+	options, err := liftOptions(c, reify.ModeSSAIR)
 	if err != nil {
-		return cli.NewExitError(err, 2)
+		return err
 	}
+	staged := "reify-staging-" + uuid.NewString()
+	options = append(options,
+		reify.WithProgramName(staged),
+		reify.WithProgramCache(ssa.ProgramCacheDBWrite),
+	)
+	result, err := reify.Lift(e.ctx, c.Args().First(), options...)
+	if err != nil {
+		return discardStagedProgram(nil, staged, err)
+	}
+	defer func() { _ = result.Close() }()
+	if result.Program == nil {
+		return discardStagedProgram(nil, staged, cli.NewExitError("save produced no SSA program", 1))
+	}
+	if err := result.Program.SaveToDatabase(); err != nil {
+		return discardStagedProgram(result.Program, staged, err)
+	}
+	if err := ssadb.FinalizeStagedProgramChecked(ssadb.GetDB(), staged, name, replace); err != nil {
+		return discardStagedProgram(result.Program, staged, err)
+	}
+	fmt.Fprintf(e.stdout, "Program: %s\n", name)
+	fmt.Fprintf(e.stdout, "Functions: %d\n", result.Functions)
+	fmt.Fprintf(e.stdout, "Blocks: %d\n", result.Blocks)
+	fmt.Fprintf(e.stdout, "Values: %d\n", result.Values)
+	fmt.Fprintf(e.stdout, "Query: reify audit --program %s '<syntaxflow>'\n", name)
+	return nil
+}
+
+// discardStagedProgram closes a cache that never reached the final flush and
+// removes the staging rows. A cleanup failure is reported together with the
+// original error, because leaving either an open writer or unreachable rows is
+// part of the failure the caller must see.
+func discardStagedProgram(program *ssa.Program, staged string, cause error) error {
+	if program != nil && program.Cache != nil && !program.Cache.IsClosed() {
+		program.Cache.CloseWithoutSave()
+	}
+	err := ssadb.DeleteProgramChecked(ssadb.GetDB(), staged)
+	if err != nil {
+		return errors.Join(cause, fmt.Errorf("discard staging program %q: %w", staged, err))
+	}
+	return cause
+}
+
+// liftOptions collects the loader, region and pass flags shared by lift, save
+// and the file form of audit. The caller selects the mode and, for save, the
+// persistence options.
+func liftOptions(c *cli.Context, mode reify.Mode) ([]reify.Option, error) {
 	syntax, err := reify.ParseAsmSyntax(c.String("asm-syntax"))
 	if err != nil {
-		return cli.NewExitError(err, 2)
+		return nil, cli.NewExitError(err, 2)
 	}
 	address, size, function := c.String("address"), c.String("size"), c.String("func")
 	if function != "" && (address != "" || size != "") {
-		return cli.NewExitError("--func cannot be combined with --address or --size", 2)
+		return nil, cli.NewExitError("--func cannot be combined with --address or --size", 2)
 	}
 	options := []reify.Option{
 		reify.WithMode(mode),
@@ -255,6 +462,109 @@ func (e *commandEnv) lift(c *cli.Context) error {
 	}
 	if passes := splitPassNames(c.String("ssa-pass")); len(passes) > 0 {
 		options = append(options, reify.WithSSAPasses(passes...))
+	}
+	return options, nil
+}
+
+// audit runs one syntaxflow rule over either a freshly lifted file or a
+// program loaded from ssadb. The file form keeps the SSA in memory; the
+// --program form reads the stored instructions and optionally opens a
+// specific SSA database.
+func (e *commandEnv) audit(c *cli.Context) error {
+	name := strings.TrimSpace(c.String("program"))
+	var (
+		file string
+		rule string
+	)
+	if name != "" {
+		if c.NArg() > 1 {
+			return cli.NewExitError("audit --program accepts one syntaxflow argument", 2)
+		}
+		if c.NArg() == 1 {
+			rule = strings.TrimSpace(c.Args().Get(0))
+		}
+	} else {
+		if c.NArg() < 1 || c.NArg() > 2 {
+			return cli.NewExitError("audit requires a file and a syntaxflow rule", 2)
+		}
+		file = c.Args().First()
+		if c.NArg() == 2 {
+			rule = strings.TrimSpace(c.Args().Get(1))
+		}
+	}
+	if rule != "" && strings.TrimSpace(c.String("rule")) != "" {
+		return cli.NewExitError("use either an argument or --rule, not both", 2)
+	}
+	if rule == "" {
+		rule = strings.TrimSpace(c.String("rule"))
+	}
+	if rule == "" {
+		return cli.NewExitError("audit requires a syntaxflow rule", 2)
+	}
+	if name == "" && c.IsSet("db") {
+		return cli.NewExitError("--db requires --program", 2)
+	}
+
+	var (
+		program     *ssaapi.Program
+		programName string
+		err         error
+	)
+	if name != "" {
+		if dbPath := strings.TrimSpace(c.String("db")); dbPath != "" {
+			database, openErr := consts.CreateSSAProjectDatabase(consts.SQLiteExtend, dbPath)
+			if openErr != nil {
+				return openErr
+			}
+			ssadb.SetDB(database)
+		}
+		program, err = ssaapi.FromDatabase(name)
+		if err != nil {
+			return err
+		}
+		programName = name
+	} else {
+		options, optionErr := liftOptions(c, reify.ModeSSAIR)
+		if optionErr != nil {
+			return optionErr
+		}
+		lifted, liftErr := reify.Lift(e.ctx, file, options...)
+		if liftErr != nil {
+			return liftErr
+		}
+		defer func() { _ = lifted.Close() }()
+		if lifted.Program == nil {
+			return cli.NewExitError("lift produced no SSA program", 1)
+		}
+		lifted.Program.FlushInstruction()
+		program = ssaapi.NewProgram(lifted.Program, nil)
+		programName = lifted.ProgramName
+	}
+
+	result, err := program.SyntaxFlowWithError(rule)
+	if err != nil {
+		return err
+	}
+	report := auditReport{Program: programName, Rule: rule, Result: result.String(), Errors: result.GetErrors()}
+	if c.Bool("json") {
+		return writeJSON(e.stdout, report)
+	}
+	fmt.Fprintf(e.stdout, "Program: %s\n", report.Program)
+	fmt.Fprint(e.stdout, report.Result)
+	return nil
+}
+
+func (e *commandEnv) lift(c *cli.Context) error {
+	if c.NArg() != 1 {
+		return cli.NewExitError("lift requires exactly one file", 2)
+	}
+	mode, err := reify.ParseMode(c.String("mode"))
+	if err != nil {
+		return cli.NewExitError(err, 2)
+	}
+	options, err := liftOptions(c, mode)
+	if err != nil {
+		return err
 	}
 	result, err := reify.Lift(e.ctx, c.Args().First(), options...)
 	if err != nil {
@@ -350,10 +660,41 @@ func liftText(result *reify.Result) io.Reader {
 		fmt.Fprintf(&text, "===== 3ssair =====\n%s", result.SSAIR)
 		fmt.Fprintf(&text, "===== 4source =====\n%s", result.Source)
 	}
+	writeLanguage(&text, result.Artifact.Language)
 	for _, diagnostic := range result.Diagnostics {
 		fmt.Fprintf(&text, "Note [%s]: %s\n", diagnostic.Code, diagnostic.Message)
 	}
 	return &text
+}
+
+func writeLanguage(w io.Writer, report *core.LanguageReport) {
+	if report == nil {
+		return
+	}
+	fmt.Fprintf(w, "Language: %s (%s)\n", report.Language, report.Confidence)
+	if report.Runtime != "" {
+		fmt.Fprintf(w, "Compiler: %s\n", report.Runtime)
+	}
+	for _, evidence := range report.Evidence {
+		fmt.Fprintf(w, "Evidence [%s]: %s\n", evidence.Source, evidence.Detail)
+	}
+	if abi := report.ABI; abi != nil {
+		parts := []string{fmt.Sprintf("%d argument registers", len(abi.Registers.Arguments))}
+		if abi.Registers.Return != "" {
+			parts = append(parts, "return "+abi.Registers.Return)
+		}
+		if abi.NoCalleeSave {
+			parts = append(parts, "no callee-saved")
+		}
+		fmt.Fprintf(w, "ABI: language override (%s)\n", strings.Join(parts, ", "))
+	}
+	if model := report.Strings; model != nil {
+		termination := "length-delimited"
+		if model.Layout == core.StringLayoutNulTerminated {
+			termination = "nul-terminated"
+		}
+		fmt.Fprintf(w, "Strings: %s (%s, %s)\n", model.Layout, model.Encoding, termination)
+	}
 }
 
 func writeBoundaryStats(text *bytes.Buffer, stats *core.BoundaryStats) {

@@ -16,6 +16,7 @@ import (
 	ssapass "github.com/yaklang/yaklang/common/yak/reify/core/ssa2source/pass"
 	"github.com/yaklang/yaklang/common/yak/reify/loader"
 	"github.com/yaklang/yaklang/common/yak/ssa"
+	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
 )
 
 // Mode selects the deepest representation rendered by Lift.
@@ -76,6 +77,12 @@ type Result struct {
 	Functions     int
 	Blocks        int
 	Values        int
+	// Program is the YakSSA program produced by the lift. It is nil for the asm
+	// and LowIR modes. A caller that wants to persist it must request the
+	// database write cache with WithProgramCache and then call SaveToDatabase.
+	Program *ssa.Program
+	// ProgramName is the name given to the SSA program, when one was requested.
+	ProgramName string
 }
 
 // Close releases the input opened by Lift.
@@ -96,6 +103,11 @@ type Config struct {
 	Address     string
 	Size        string
 	Function    string
+	// ProgramName names the generated YakSSA program.
+	ProgramName string
+	// CacheKind selects the program cache. The default keeps the SSA in memory;
+	// a producer that writes ssadb asks for ProgramCacheDBWrite.
+	CacheKind ssa.ProgramCacheKind
 	// Format forces one loader. It is needed only for a format that carries no
 	// magic, such as a COM image.
 	Format string
@@ -139,6 +151,17 @@ func WithFunction(name string) Option { return func(config *Config) { config.Fun
 // WithFormat forces one loader by format name. It is needed only for a format
 // that carries no magic, such as a COM image.
 func WithFormat(name string) Option { return func(config *Config) { config.Format = name } }
+
+// WithProgramName names the YakSSA program produced by a lift.
+func WithProgramName(name string) Option {
+	return func(config *Config) { config.ProgramName = name }
+}
+
+// WithProgramCache selects the cache used by the YakSSA program. Use
+// ssa.ProgramCacheDBWrite before calling SaveToDatabase.
+func WithProgramCache(kind ssa.ProgramCacheKind) Option {
+	return func(config *Config) { config.CacheKind = kind }
+}
 
 // resolveFormat validates a forced format name against the register.
 func resolveFormat(name string) (core.Format, error) {
@@ -285,11 +308,31 @@ func Lift(ctx context.Context, path string, options ...Option) (*Result, error) 
 	// A load from a table of addresses names the object it points at, so the
 	// converter reads the table through the artifact.
 	convertOptions = append(convertOptions, lowir2ssa.WithPointerReader(pointerReader(artifact)))
+	// A binary has no source language. Record C as the modeled language so the
+	// ir_programs row and language-aware rules have a stable value.
+	convertOptions = append(convertOptions, lowir2ssa.WithLanguage(ssaconfig.C))
+	if settings.ProgramName != "" {
+		convertOptions = append(convertOptions, lowir2ssa.WithProgramName(settings.ProgramName))
+	}
+	if settings.CacheKind != 0 {
+		convertOptions = append(convertOptions, lowir2ssa.WithProgramCache(settings.CacheKind))
+	}
 	converted, err := lowir2ssa.Convert(ctx, parsed.IR, convertOptions...)
 	if err != nil {
 		return nil, err
 	}
+	// A failure after conversion must close the program cache. Otherwise a DB
+	// writer can keep flushing a program that the caller never receives, and a
+	// staging program would be recreated after its cleanup.
+	program := converted.Program
+	defer func() {
+		if !ok && program != nil && program.Cache != nil && !program.Cache.IsClosed() {
+			program.Cache.CloseWithoutSave()
+		}
+	}()
 	result.Diagnostics = append(result.Diagnostics, converted.Diagnostics...)
+	result.Program = converted.Program
+	result.ProgramName = converted.Program.GetProgramName()
 	if err := applySSAPasses(converted.Program, artifact, settings.SSAPasses); err != nil {
 		return nil, err
 	}
@@ -338,7 +381,7 @@ func addressRegion(artifact *core.Artifact, addressText, sizeText string) (core.
 		return core.Region{}, fmt.Errorf("lift: artifact has no symbols")
 	}
 	for _, symbol := range artifact.Image.Symbols {
-		if symbol.Name != name {
+		if symbol.Name != name && symbol.Mangled != name {
 			continue
 		}
 		if symbol.Address == 0 || symbol.Imported {

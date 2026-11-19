@@ -12,8 +12,9 @@ Reify 是 Yaklang 的程序表示接入框架。它把文件格式、目标平�
 | 指令集 | `core.Architecture` | 一个 Parser 对应一种架构 |
 | 字节序 | `core.ByteOrder` | ByteReader 的读取模式 |
 | 指令操作 | `core.Opcode` | LowIR 指令的 Kind |
+| 产物语言 | `core.Language` | 语言层在 Loader 之后识别，见 [语言层](docs/language.md) |
 
-Loader 和 Parser 使用两条独立的分派路径。ELF、PE、Mach-O、COFF、ar 与 MZ 各自有独立 loader 包；十三种架构都有解码器。操作系统、ABI 和执行模式属于 Target，随请求传给 parser。
+Loader 和 Parser 使用两条独立的分派路径。ELF、PE、Mach-O、COFF、ar 与 MZ 各自有独立 loader 包；十三种架构都有解码器。操作系统、ABI 和执行模式属于 Target，随请求传给 parser。产物语言不参与这两条分派：语言层在 loader 完成后读取编译器元数据、恢复符号并按函数挂 ABI 覆盖，见 [语言层](docs/language.md)。
 
 ```text
 path ── os.File ── ByteReader ── Format ── Loader ── Artifact
@@ -39,6 +40,8 @@ common/yak/reify/
 │   ├── target.go          # Target
 │   ├── reader.go          # ByteReader（按字节序读取，边界受限）
 │   ├── image.go           # Image、Section
+│   ├── language.go        # LanguageReport、ABI、置信度
+│   ├── stringmodel.go     # Strings：布局、编码与 Decode
 │   ├── symbol.go          # Symbol、SymbolAt
 │   ├── artifact.go        # Artifact、Region
 │   ├── loader.go          # Loader 接口与 CheckResult
@@ -53,6 +56,10 @@ common/yak/reify/
 ├── reify.go               # 统一 API：load、lift、pass options
 ├── loader/
 │   ├── catalog.go         # 全局 Catalog：注册、检测、打开、检查
+│   ├── language/          # 语言层：契约、注册表、符号合并
+│   │   ├── c/             # 默认层：C 标签与 NUL 字符串，无 ABI 覆盖
+│   │   ├── golang/        # Go pclntab 恢复、ABI 与字符串模型
+│   │   └── rust/          # Rust v0/legacy 解码器、恢复与字符串模型
 │   ├── fileformat/        # ELF、PE、Mach-O Loader
 │   │   └── elf/           # ELF Loader、符号与 BoundaryHints
 │   └── arch/              # 按 Architecture 注册的 Parser
@@ -64,7 +71,7 @@ common/yak/reify/
 │           ├── lift.go
 │           └── regs.go
 ├── cmd/reify/             # 命令行入口
-└── docs/                  # 架构、接口、LowIR、SSA 和命令文档
+└── docs/                  # 架构、接口、语言层、LowIR、SSA 和命令文档
 ```
 
 ## 快速使用
@@ -88,9 +95,23 @@ go build -o "$OUT/bin/reify" ./common/yak/reify/cmd/reify
 "$OUT/bin/reify" lift --mode all --func main /bin/ls
 "$OUT/bin/reify" lift --mode source --address 0xmain --size 0x40 /bin/ls
 "$OUT/bin/reify" lift --json --mode lowir /bin/true
+"$OUT/bin/reify" strings --at greeting ./fixture
+
+# lift 到 SSA 后直接审计
+"$OUT/bin/reify" audit /bin/ls '*() as $call' --section .text
+
+# lift 到 SSA，落库到 ssadb，再从数据库审计
+export YAKIT_HOME="$OUT/yakit-home"
+"$OUT/bin/reify" save /bin/ls --name ls-binary --section .text
+"$OUT/bin/reify" audit --program ls-binary 'printf(* as $args) as $call'
+"$OUT/bin/reify" audit --program ls-binary \
+  --db "$OUT/yakit-home/default-yakssa.db" 'printf(* as $args) as $call'
+"$OUT/bin/reify" audit --program ls-binary '*?{opcode: call} as $call'
 ```
 
 `lift` 默认输出 `asm`。默认恢复并解码全部已发现函数；`--section` 选择单个节，`--func` 选择一个函数，`--address/--size` 选择地址区间。`--mode` 选择 `asm`、`lowir`、`ssair`、`source` 或 `all`。默认使用 Intel 语法；`--asm-syntax att` 切换 GNU/AT&T。用 `--address` 和 `--size` 可以限定一个连续代码区域。两个参数必须同时给出。
+
+`save` 先调用 lift 得到 `Result.Program`，再调用 `Program.SaveToDatabase()` 写入 ssadb。新程序先写到临时程序名；写完后才在一个事务内替换同名旧程序。参数错误、文件缺失或 lift 失败都不会修改旧程序。`YAKIT_HOME` 选择数据库目录；同名程序默认拒绝写入，加 `--replace` 允许替换。`audit <file> '<syntaxflow>'` 在内存 SSA 上执行 SyntaxFlow。`audit --program <name> '<syntaxflow>'` 从 ssadb 加载程序后执行；`--db` 可指定数据库文件。规则也可以写到 `--rule`。`--json` 输出结构化结果。
 
 `ssair` 先执行 LowIR 转换，再输出 YakSSA 文本。`source` 在 `ssair` 之后输出伪源码。两者都不是可编译源码。
 
@@ -102,7 +123,7 @@ common/yak/reify/scripts/lift-all.sh -o /mnt/data/scan-outputs/reify-lift /bin/t
 
 脚本按 `1asm`、`2lowir`、`3ssair`、`4source` 顺序生成 `<name>.1asm.txt`、`<name>.2lowir.txt`、`<name>.3ssair.txt`、`<name>.4source.txt` 和 `version`。无 `-a/-s` 时输出到 `<output>/all`。`version` 记录版本、提交哈希和输入摘要。
 
-示例程序在 `test/examples/`：`hello.c` 是最小入口；`linked_list.c` 含结构体、成员访问、循环、条件、函数调用、malloc 和 free；`control_flow.c` 用 `classify` 与 `accumulate` 演示 if/else 与 for。
+示例程序在 `test/examples/`：`hello.c` 是最小入口；`linked_list.c` 含结构体、成员访问、循环、条件、函数调用、malloc 和 free；`control_flow.c` 用 `classify` 与 `accumulate` 演示 if/else 与 for。`go_hello.go`、`go_interface.go`、`rust_hello.rs`、`rust_trait.rs` 是语言层样例，构建命令写在文件头与 [test/examples/README.md](test/examples/README.md)。
 
 代码中的调用链：
 

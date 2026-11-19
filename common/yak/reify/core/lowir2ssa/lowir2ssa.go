@@ -32,11 +32,28 @@ type Result struct {
 type Options struct {
 	ProgramName string
 	LowIRPasses []string
+	// CacheKind selects the program cache. The default keeps the program in
+	// memory; a producer that writes ssadb asks for ProgramCacheDBWrite.
+	CacheKind ssa.ProgramCacheKind
+	// Language is recorded on the program and the ir_programs row.
+	Language ssaconfig.Language
 	// PointerAt resolves a pointer-sized value stored at an image address. A
 	// target reaches a global through a table of addresses, so a load from that
 	// table has to become the address it holds; otherwise every access stays
 	// symbolic and the object it names cannot be recovered.
 	PointerAt func(address uint64, size uint16) (uint64, bool)
+}
+
+// WithProgramCache selects the program cache kind. ProgramCacheDBWrite makes
+// every emitted instruction reach ssadb at SaveToDatabase time.
+func WithProgramCache(kind ssa.ProgramCacheKind) Option {
+	return func(options *Options) { options.CacheKind = kind }
+}
+
+// WithLanguage records the program language. A lifted binary has no source
+// language of its own, so the caller names the language family it models.
+func WithLanguage(language ssaconfig.Language) Option {
+	return func(options *Options) { options.Language = language }
 }
 
 // WithPointerReader supplies the table lookup that turns a load from a table of
@@ -70,7 +87,7 @@ func Convert(ctx context.Context, ir *core.LowIR, options ...Option) (*Result, e
 	if len(ir.Functions) == 0 {
 		return nil, fmt.Errorf("lowir2ssa: LowIR has no functions")
 	}
-	settings := Options{ProgramName: "reify-lowir"}
+	settings := Options{ProgramName: "reify-lowir", CacheKind: ssa.ProgramCacheMemory, Language: ssaconfig.General}
 	for _, option := range options {
 		option(&settings)
 	}
@@ -78,7 +95,10 @@ func Convert(ctx context.Context, ir *core.LowIR, options ...Option) (*Result, e
 	if err != nil {
 		return nil, fmt.Errorf("lowir2ssa: invalid program config: %w", err)
 	}
-	program := ssa.NewProgram(cfg, ssa.ProgramCacheMemory, ssa.Application, nil, "", 0)
+	program := ssa.NewProgram(cfg, settings.CacheKind, ssa.Application, nil, "", 0)
+	if settings.Language != "" {
+		program.Language = settings.Language
+	}
 	converter := &converter{
 		ctx:         ctx,
 		program:     program,
@@ -97,9 +117,11 @@ func Convert(ctx context.Context, ir *core.LowIR, options ...Option) (*Result, e
 		if len(names) == 0 {
 			names = pass.DefaultNames()
 		}
-		if err := pass.Apply(&function, ir.Facts(), names...); err != nil {
+		facts := ir.FactsFor(function)
+		if err := pass.Apply(&function, facts, names...); err != nil {
 			return nil, err
 		}
+		converter.facts = facts
 		function.FrameCleanup = containsPass(names, "remove-stackframe")
 		function.FrameKept = !function.FrameCleanup
 		if err := converter.convertFunction(function); err != nil {

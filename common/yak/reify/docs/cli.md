@@ -20,6 +20,7 @@ go build -o "$OUT/bin/reify" ./common/yak/reify/cmd/reify
 | `parsers` | `--json` 可选 | 按 Architecture 注册的 parser 与解码器状态 |
 | `inspect` | `<file>`，`--json`、`--format` 可选 | Artifact、Target、Image、节和诊断 |
 | `check` | `<file>`，`--json`、`--format` 可选 | 头部检查、loader 和 parser 选择 |
+| `strings` | `<file>`，`--at` 必填，`--json`、`--format` 可选 | 按语言模型解码一个字符串 |
 | `lift` | `<file>`，`--mode`、`--json`、`--format` 可选 | 汇编、LowIR、YakSSA 或伪源码 |
 | `help` | 无 | 用法 |
 
@@ -36,7 +37,7 @@ go build -o "$OUT/bin/reify" ./common/yak/reify/cmd/reify
 `lift` 的转换选项：
 
 - `--asm-syntax intel|att`：汇编语法，默认 `intel`；`att` 输出 GNU/AT&T 语法。
-- `--func NAME`：反编译一个已恢复函数；不能和 `--address/--size` 同用。
+- `--func NAME`：反编译一个已恢复函数；不能和 `--address/--size` 同用。Rust 函数可用展示名（`rust_hello::add`）或原始编码名（`_RNvCs4FrXkKnA8Dq_10rust_hello3add`）。
 - `--address` 也接受函数符号名（`sum_points` 或 `0xsum_points`）。
 - `--lowir-pass NAME[,NAME...]`：只运行指定的 LowIR pass，默认运行全部默认 pass（含去 canary 和栈帧）。只影响 `ssair`、`source` 和 `all`；`lowir` 输出 asm2lowir 得到的普通 LowIR。
 - `--ssa-pass NAME[,NAME...]`：只运行指定的 SSA pass，默认运行标准 pass 序列。
@@ -64,7 +65,34 @@ go build -o "$OUT/bin/reify" ./common/yak/reify/cmd/reify
 "$OUT/bin/reify" lift --mode source --func main /bin/true
 "$OUT/bin/reify" lift --mode all --func main /bin/true
 "$OUT/bin/reify" lift --json --mode lowir /bin/true
+"$OUT/bin/reify" strings --at 0x2590 /bin/true
 ```
+
+Go 与 Rust 产物（容器仍是 ELF/PE/Mach-O）：
+
+```bash
+"$OUT/bin/reify" inspect "$RUN/go_hello_stripped"
+"$OUT/bin/reify" lift --mode all --func main.Add "$RUN/go_hello_stripped"
+"$OUT/bin/reify" lift --mode all --func rust_hello::add "$RUN/rust_hello"
+"$OUT/bin/reify" lift --mode all --func _RNvCs4FrXkKnA8Dq_10rust_hello3add "$RUN/rust_hello"
+```
+
+`strings` 用检测到的语言模型解码一个值：
+
+- C（`nul-terminated`）：`--at` 是字节地址，读到 NUL 为止。
+- Go/Rust（`pointer-length`）：`--at` 是描述符地址，读指针与长度后再读字节。
+- `--at` 也接受符号名。Go 允许非法 UTF-8，Rust 模型会拒绝。
+
+```text
+Scope: one string
+Input: "fixture"
+Language: c (none)
+Strings: nul-terminated (bytes, nul-terminated)
+Address: 0x404028
+Value: "reify-string"
+```
+
+`inspect` 始终打印 `Language` 行。语言提供覆盖时还会输出 `ABI` 与 `Strings` 行；没有语言覆盖的产物不打印这两行，仍按平台约定处理。剥离符号的 Go 产物会显示 `Evidence [pclntab]`，Rust 产物会显示 demangle 后的函数名。样例构建命令见 [test/examples/README.md](../test/examples/README.md)。
 
 ## loaders 与 parsers
 
@@ -106,6 +134,13 @@ Loader: ELF
 Format: elf
 Target: unknown/amd64, 64-bit, little-endian, abi ELFOSABI_NONE, machine EM_X86_64
 Parser: amd64 (available)
+Language: go (certain)
+Compiler: go1.27.4-X:nodwarf5
+Evidence [buildinfo]: go1.27.4-X:nodwarf5
+Evidence [section]: .gopclntab
+Evidence [pclntab]: 1481 functions
+ABI: language override (9 argument registers, return rax, no callee-saved)
+Strings: go (pointer+length, utf-8, not nul-terminated)
 Object: ET_DYN
 Header entry: 0x2590
 SECTION       FILE OFFSET  FILE SIZE  VIRTUAL ADDRESS  MEMORY SIZE

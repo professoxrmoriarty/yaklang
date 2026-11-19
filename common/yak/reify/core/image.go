@@ -47,6 +47,15 @@ type Image struct {
 	byAddress map[uint64][]symbol.Symbol
 }
 
+// SetSymbols replaces the symbol table during artifact construction. Call it
+// before publishing the image to concurrent readers; it invalidates the lazy
+// address index when a metadata layer adds or renames symbols.
+func (i *Image) SetSymbols(symbols []symbol.Symbol) {
+	i.Symbols = symbols
+	i.once = sync.Once{}
+	i.byAddress = nil
+}
+
 func (i *Image) ImageBase() uint64 {
 	if i == nil {
 		return 0
@@ -67,13 +76,22 @@ func (i *Image) SectionAt(address uint64) (*Section, bool) {
 	if i == nil {
 		return nil, false
 	}
+	// A TLS .tbss can share virtual addresses with the sections that follow it;
+	// its bytes are not in the file. Prefer a section that can supply bytes.
+	var zeroFill *Section
 	for idx := range i.Sections {
 		section := &i.Sections[idx]
-		if address >= section.VirtualAddress && address-section.VirtualAddress < section.MemorySize {
+		if address < section.VirtualAddress || address-section.VirtualAddress >= section.MemorySize {
+			continue
+		}
+		if address-section.VirtualAddress < section.FileSize {
 			return section, true
 		}
+		if zeroFill == nil {
+			zeroFill = section
+		}
 	}
-	return nil, false
+	return zeroFill, zeroFill != nil
 }
 
 // RelocationAt returns the relocation that writes this address.
@@ -104,13 +122,20 @@ func (i *Image) SymbolsAt(address uint64) []symbol.Symbol {
 	return i.byAddress[address]
 }
 
-// SymbolByName returns the first symbol with this name.
+// SymbolByName returns the first symbol with this name. A language layer keeps
+// the compiler-encoded name in Mangled, so a caller may pass either the display
+// name or the encoded one.
 func (i *Image) SymbolByName(name string) (symbol.Symbol, bool) {
 	if i == nil || name == "" {
 		return symbol.Symbol{}, false
 	}
 	for _, entry := range i.Symbols {
 		if entry.Name == name {
+			return entry, true
+		}
+	}
+	for _, entry := range i.Symbols {
+		if entry.Mangled == name {
 			return entry, true
 		}
 	}
