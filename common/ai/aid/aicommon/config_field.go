@@ -2,13 +2,14 @@ package aicommon
 
 import (
 	"fmt"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"github.com/yaklang/yaklang/common/ai/aid/aitool/buildinaitools"
 	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils"
-	"strings"
-	"time"
-
-	"sync/atomic"
 )
 
 func (c *Config) GetTimeline() *Timeline {
@@ -186,6 +187,63 @@ func (c *Config) GetGoalDurationSeconds() int64 {
 	return c.GoalDurationSeconds
 }
 
+// GoalTimeState is the authoritative runtime goal-time view exposed to clients.
+type GoalTimeState struct {
+	Revision        uint64
+	Started         bool
+	NeverEnding     bool
+	DurationSeconds int64
+	DeadlineUnix    int64
+}
+
+func (c *Config) GetGoalTimeState() GoalTimeState {
+	if c == nil {
+		return GoalTimeState{}
+	}
+	c.m.Lock()
+	defer c.m.Unlock()
+
+	state := GoalTimeState{
+		Revision:        c.goalTimeRevision,
+		Started:         !c.GoalDeadline.IsZero(),
+		NeverEnding:     c.GoalDurationSeconds == -1,
+		DurationSeconds: c.GoalDurationSeconds,
+	}
+	if !state.Started || state.NeverEnding {
+		return state
+	}
+	state.DeadlineUnix = c.GoalDeadline.Unix()
+	return state
+}
+
+// setGoalDurationSeconds applies a new goal time window. If the deadline has
+// already been started, a changed duration takes effect immediately from the
+// hot-reload point. Reapplying the same value does not extend the countdown.
+func (c *Config) setGoalDurationSeconds(seconds int64) {
+	if c == nil {
+		return
+	}
+	if c.m == nil {
+		c.m = new(sync.Mutex)
+	}
+	c.m.Lock()
+	defer c.m.Unlock()
+
+	changed := c.GoalDurationSeconds != seconds
+	if !changed {
+		return
+	}
+	c.GoalDurationSeconds = seconds
+	c.goalTimeRevision++
+	if seconds == 0 {
+		c.GoalDeadline = time.Time{}
+		return
+	}
+	if !c.GoalDeadline.IsZero() {
+		c.GoalDeadline = computeGoalDeadline(time.Now(), seconds)
+	}
+}
+
 func (c *Config) GetGoalAcceptanceCriteria() string {
 	if c == nil {
 		return ""
@@ -217,18 +275,28 @@ func (c *Config) StartGoalDeadline() {
 		return
 	}
 	c.m.Lock()
-	defer c.m.Unlock()
 	if c.GoalDurationSeconds == 0 {
+		c.m.Unlock()
 		return
 	}
 	if !c.GoalDeadline.IsZero() {
+		c.m.Unlock()
 		return // already started
 	}
-	if c.GoalDurationSeconds == -1 {
-		c.GoalDeadline = time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
-		return
+	c.GoalDeadline = computeGoalDeadline(time.Now(), c.GoalDurationSeconds)
+	c.goalTimeRevision++
+	c.m.Unlock()
+	c.notifyAgentPolicySnapshotEmit()
+}
+
+func computeGoalDeadline(start time.Time, durationSeconds int64) time.Time {
+	if durationSeconds == 0 {
+		return time.Time{}
 	}
-	c.GoalDeadline = time.Now().Add(time.Duration(c.GoalDurationSeconds) * time.Second)
+	if durationSeconds == -1 {
+		return time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
+	}
+	return start.Add(time.Duration(durationSeconds) * time.Second)
 }
 
 // IsGoalDeadlinePassed reports whether the goal time window has elapsed.

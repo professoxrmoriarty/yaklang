@@ -386,6 +386,9 @@ type Config struct {
 	GoalDurationSeconds      int64     // Goal mode time window in seconds; -1 = never auto-finish, 0 = disabled
 	GoalAcceptanceCriteria   string    // Goal mode acceptance criteria; non-empty enables one main-model review turn
 	GoalDeadline             time.Time // Computed deadline for goal time window (zero = not started)
+	goalTimeRevision         uint64
+	agentPolicyRevision      uint64
+	agentPolicyEmitHandler   func()
 	DisableIncreaseIteration bool
 
 	// task config
@@ -2636,12 +2639,7 @@ func WithGoalMinIterations(n int64) ConfigOption {
 // 0: time window gate is disabled (default).
 func WithGoalDurationSeconds(seconds int64) ConfigOption {
 	return func(c *Config) error {
-		if c.m == nil {
-			c.m = &sync.Mutex{}
-		}
-		c.m.Lock()
-		c.GoalDurationSeconds = seconds
-		c.m.Unlock()
+		c.setGoalDurationSeconds(seconds)
 		return nil
 	}
 }
