@@ -13,8 +13,11 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"runtime/debug"
+	"slices"
 	"strings"
 
+	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/yak/reify/core"
 	"github.com/yaklang/yaklang/common/yak/reify/core/lowir2ssa/pass"
 	"github.com/yaklang/yaklang/common/yak/ssa"
@@ -100,13 +103,14 @@ func Convert(ctx context.Context, ir *core.LowIR, options ...Option) (*Result, e
 		program.Language = settings.Language
 	}
 	converter := &converter{
-		ctx:         ctx,
-		program:     program,
-		facts:       ir.Facts(),
-		pointerAt:   settings.PointerAt,
-		frameValues: make(map[ssa.Value]bool),
-		spDerived:   make(map[ssa.Value]bool),
-		diagnostics: make([]core.Diagnostic, 0),
+		ctx:          ctx,
+		program:      program,
+		facts:        ir.Facts(),
+		pointerAt:    settings.PointerAt,
+		frameValues:  make(map[ssa.Value]bool),
+		spDerived:    make(map[ssa.Value]bool),
+		frameDerived: make(map[ssa.Value]bool),
+		diagnostics:  make([]core.Diagnostic, 0),
 	}
 	for index := range ir.Functions {
 		if err := ctx.Err(); err != nil {
@@ -124,11 +128,29 @@ func Convert(ctx context.Context, ir *core.LowIR, options ...Option) (*Result, e
 		converter.facts = facts
 		function.FrameCleanup = containsPass(names, "remove-stackframe")
 		function.FrameKept = !function.FrameCleanup
-		if err := converter.convertFunction(function); err != nil {
+		if err := convertFunctionSafely(converter, function); err != nil {
 			return nil, err
 		}
 	}
 	return &Result{Program: program, Diagnostics: converter.diagnostics}, nil
+}
+
+// convertFunctionSafely turns a conversion panic into an error that names the
+// function. A malformed instruction stream must not abort the process, and the
+// caller can report the diagnostic with the rest of the run. The recovered value
+// and the stack go to the log, because a panic here is a defect in the converter
+// and the message alone does not say where it started.
+func convertFunctionSafely(converter *converter, function core.Function) (err error) {
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			return
+		}
+		log.Errorf("lowir2ssa: function %s at 0x%x panicked: %v\n%s",
+			functionName(function), function.Address, recovered, debug.Stack())
+		err = fmt.Errorf("lowir2ssa: function %s at 0x%x: %v", functionName(function), function.Address, recovered)
+	}()
+	return converter.convertFunction(function)
 }
 
 // Text renders the converted program with YakSSA's disassembler. Extern call
@@ -140,6 +162,13 @@ func Text(program *ssa.Program) string {
 	return ssairtext.FormatProgram(program)
 }
 
+// loopPhiRef keeps a header phi together with the key the loop carries, so
+// filling its edge does not depend on the phi name.
+type loopPhiRef struct {
+	key string
+	phi *ssa.Phi
+}
+
 type converter struct {
 	ctx         context.Context
 	program     *ssa.Program
@@ -148,6 +177,7 @@ type converter struct {
 	builder     *ssa.FunctionBuilder
 	entry       *ssa.BasicBlock
 	blocks      map[core.BlockID]*ssa.BasicBlock
+	blockOrder  []core.BlockID
 	values      map[core.ValueID]ssa.Value
 	defs        map[core.ValueID]core.Instruction
 	variables   map[string]*ssa.Variable
@@ -159,20 +189,33 @@ type converter struct {
 	arguments   map[string]bool
 	loopHeaders map[core.BlockID]bool
 	loopPhis    map[core.BlockID]map[string]*ssa.Phi
-	loopPhiDone map[int64]bool
-	headerStore map[core.BlockID]map[string]bool
-	loopCarried map[core.BlockID]map[string]bool
+	// loopPhiOrder lists the phis of a header in creation order, which decides
+	// their identifiers and the printed text.
+	loopPhiOrder map[core.BlockID][]loopPhiRef
+	loopPhiDone  map[int64]bool
+	headerStore  map[core.BlockID]map[string]bool
+	// loopCarried lists the memory keys a header carries, in the order the loop
+	// body first touches them.
+	loopCarried map[core.BlockID][]string
 	// mergePhis holds the join phis of a block keyed by the register key, and
-	// blockOut holds the value a block leaves in each register.
-	mergePhis  map[core.BlockID]map[string]*ssa.Phi
-	blockOut   map[core.BlockID]map[string]ssa.Value
-	lowirBySSA map[int64]core.BlockID
-	idom       map[core.BlockID]core.BlockID
-	predsOf    map[core.BlockID][]core.BlockID
-	current    core.BlockID
-	types      map[core.ValueType]ssa.Type
-	undefined  map[string]ssa.Value
-	facts      core.ArchFacts
+	// blockOut holds the value a block leaves in each register. mergePhiOrder
+	// keeps the creation order of those phis.
+	mergePhis     map[core.BlockID]map[string]*ssa.Phi
+	mergePhiOrder map[core.BlockID][]string
+	blockOut      map[core.BlockID]map[string]ssa.Value
+	lowirBySSA    map[int64]core.BlockID
+	idom          map[core.BlockID]core.BlockID
+	predsOf       map[core.BlockID][]core.BlockID
+	current       core.BlockID
+	types         map[core.ValueType]ssa.Type
+	signedTypes   map[uint16]ssa.Type
+	undefined     map[string]ssa.Value
+	facts         core.ArchFacts
+	// memoryValid records whether a memory variable still holds the value its
+	// last store wrote. A store through a different address expression that may
+	// alias it clears the flag, so a later load keeps the reload.
+	memoryValid map[string]bool
+	memoryKind  map[string]memorySlotKind
 	// stackStores collects the values a cdecl caller stores for its arguments.
 	stackStores []ssa.Value
 	// frameValues marks the values read from a frame register, which a prologue
@@ -183,6 +226,10 @@ type converter struct {
 	// spDerived marks the values computed from the stack pointer. A cdecl
 	// argument area is the only thing a caller stores through that chain.
 	spDerived map[ssa.Value]bool
+	// frameDerived marks the values computed from the frame pointer. A local
+	// variable slot is addressed through either pointer, and both are inside the
+	// current frame.
+	frameDerived map[ssa.Value]bool
 	// sourceFunction is the LowIR function being converted. A few entry values are
 	// derived from its address.
 	sourceFunction core.Function
@@ -229,14 +276,20 @@ func (c *converter) convertFunction(function core.Function) error {
 	c.arguments = make(map[string]bool)
 	c.loopHeaders = make(map[core.BlockID]bool)
 	c.loopPhis = make(map[core.BlockID]map[string]*ssa.Phi)
+	c.loopPhiOrder = make(map[core.BlockID][]loopPhiRef)
 	c.loopPhiDone = make(map[int64]bool)
 	c.headerStore = make(map[core.BlockID]map[string]bool)
-	c.loopCarried = make(map[core.BlockID]map[string]bool)
+	c.loopCarried = make(map[core.BlockID][]string)
 	c.mergePhis = make(map[core.BlockID]map[string]*ssa.Phi)
+	c.mergePhiOrder = make(map[core.BlockID][]string)
 	c.blockOut = make(map[core.BlockID]map[string]ssa.Value)
 	c.lowirBySSA = make(map[int64]core.BlockID, len(function.Blocks))
 	c.types = make(map[core.ValueType]ssa.Type)
+	c.signedTypes = make(map[uint16]ssa.Type)
 	c.undefined = make(map[string]ssa.Value)
+	c.memoryValid = make(map[string]bool)
+	c.memoryKind = make(map[string]memorySlotKind)
+	c.frameDerived = make(map[ssa.Value]bool)
 
 	for index, block := range function.Blocks {
 		var ssaBlock *ssa.BasicBlock
@@ -250,6 +303,7 @@ func (c *converter) convertFunction(function core.Function) error {
 			return fmt.Errorf("lowir2ssa: cannot create block b%d", block.ID)
 		}
 		c.blocks[block.ID] = ssaBlock
+		c.blockOrder = append(c.blockOrder, block.ID)
 	}
 	// The block ids are stable only after every block exists, so the reverse map is
 	// built here rather than inside the creation loop.
@@ -299,11 +353,8 @@ func (c *converter) markLoopHeaders(function core.Function) {
 }
 
 func (c *converter) collectLoopCarried(function core.Function) {
-	order := make(map[core.BlockID]int, len(function.Blocks))
-	for index, block := range function.Blocks {
-		order[block.ID] = index
-	}
-	for header, position := range order {
+	for position, block := range function.Blocks {
+		header := block.ID
 		if !c.loopHeaders[header] {
 			continue
 		}
@@ -323,6 +374,10 @@ func (c *converter) collectLoopCarried(function core.Function) {
 		if last <= position {
 			continue
 		}
+		// The keys keep the order the body first touches the memory, so the phis of
+		// the header get stable identifiers without sorting.
+		var order []string
+		seen := make(map[string]bool)
 		loaded := make(map[string]bool)
 		stored := make(map[string]bool)
 		for index := position; index <= last; index++ {
@@ -330,19 +385,29 @@ func (c *converter) collectLoopCarried(function core.Function) {
 				switch instruction.Kind {
 				case core.OpLoad:
 					if len(instruction.Operands) > 0 {
-						loaded[valueKey(c.defs, instruction.Operands[0].Value)] = true
+						key := valueKey(c.defs, instruction.Operands[0].Value)
+						if !seen[key] {
+							seen[key] = true
+							order = append(order, key)
+						}
+						loaded[key] = true
 					}
 				case core.OpStore:
 					if len(instruction.Operands) > 0 {
-						stored[valueKey(c.defs, instruction.Operands[0].Value)] = true
+						key := valueKey(c.defs, instruction.Operands[0].Value)
+						if !seen[key] {
+							seen[key] = true
+							order = append(order, key)
+						}
+						stored[key] = true
 					}
 				}
 			}
 		}
-		keys := make(map[string]bool)
-		for key := range loaded {
-			if stored[key] {
-				keys[key] = true
+		var keys []string
+		for _, key := range order {
+			if loaded[key] && stored[key] {
+				keys = append(keys, key)
 			}
 		}
 		if len(keys) > 0 {
@@ -352,7 +417,7 @@ func (c *converter) collectLoopCarried(function core.Function) {
 }
 
 func (c *converter) prepareLoopPhis(blockID core.BlockID) {
-	for key := range c.loopCarried[blockID] {
+	for _, key := range c.loopCarried[blockID] {
 		c.loopPhi("mem:"+key, c.memoryVariable(c.memoryName(key)))
 	}
 }
@@ -439,6 +504,17 @@ func (c *converter) convertBlock(block core.Block) error {
 			return err
 		}
 		c.convertInstruction(instruction)
+		// A terminator does not necessarily finish the block: a jump with an
+		// unresolved target falls back to a return, and a malformed input can
+		// place more instructions after it. They are unreachable, and emitting
+		// them would build SSA on a finished block, where every operation
+		// returns nil.
+		switch instruction.Kind {
+		case core.OpJump, core.OpBranch, core.OpReturn, core.OpTrap:
+			c.builder.EmitReturn(nil)
+			c.fillLoopCarried(block)
+			return nil
+		}
 	}
 	c.fillLoopCarried(block)
 	// A malformed or truncated LowIR block may have no terminator. Preserve a
@@ -483,8 +559,10 @@ func (c *converter) convertInstruction(instruction core.Instruction) {
 		c.emitBinary(instruction, ssa.OpSub)
 	case core.OpMul:
 		c.emitBinary(instruction, ssa.OpMul)
-	case core.OpUDiv, core.OpSDiv:
-		c.emitBinary(instruction, ssa.OpDiv)
+	case core.OpUDiv:
+		c.emitOrderedBinary(instruction, ssa.OpDiv, false)
+	case core.OpSDiv:
+		c.emitOrderedBinary(instruction, ssa.OpDiv, true)
 	case core.OpAnd:
 		c.emitBinary(instruction, ssa.OpAnd)
 	case core.OpOr:
@@ -493,12 +571,16 @@ func (c *converter) convertInstruction(instruction core.Instruction) {
 		c.emitBinary(instruction, ssa.OpXor)
 	case core.OpShl:
 		c.emitBinary(instruction, ssa.OpShl)
-	case core.OpLShr, core.OpAShr:
-		c.emitBinary(instruction, ssa.OpShr)
+	case core.OpLShr:
+		c.emitOrderedBinary(instruction, ssa.OpShr, false)
+	case core.OpAShr:
+		c.emitOrderedBinary(instruction, ssa.OpShr, true)
 	case core.OpEqual:
 		c.emitBinary(instruction, ssa.OpEq)
-	case core.OpULess, core.OpSLess:
-		c.emitBinary(instruction, ssa.OpLt)
+	case core.OpULess:
+		c.emitOrderedCompare(instruction, ssa.OpLt, false)
+	case core.OpSLess:
+		c.emitOrderedCompare(instruction, ssa.OpLt, true)
 	case core.OpNeg:
 		c.emitUnary(instruction, ssa.OpNeg)
 	case core.OpNot:
@@ -526,8 +608,18 @@ func (c *converter) convertInstruction(instruction core.Instruction) {
 	case core.OpReturn:
 		values := c.operandValues(instruction.Operands)
 		if len(values) == 0 {
-			if value := c.currentRegister(c.returnRegister()); value != nil {
-				values = append(values, value)
+			// The instruction names the architecture return register in the
+			// architecture spelling (eax on 32-bit x86). Register writes are
+			// stored under the canonical view, so the fallback has to normalize
+			// the name first or it reads a variable that was never written.
+			if name := c.returnRegister(); name != "" {
+				view := c.registerView(name, c.facts.Registers.Width)
+				if value := c.registerValue(view); value != nil {
+					if view.narrow() {
+						value = c.extractRegister(value, view)
+					}
+					values = append(values, value)
+				}
 			}
 		}
 		c.builder.EmitReturn(values)
@@ -634,6 +726,9 @@ func (c *converter) emitRegisterRead(instruction core.Instruction) {
 	if view.canonical == c.registerView(c.facts.Frame.StackPointer, 0).canonical {
 		c.spDerived[value] = true
 	}
+	if framePointer := c.facts.Frame.FramePointer; framePointer != "" && view.canonical == c.registerView(framePointer, 0).canonical {
+		c.frameDerived[value] = true
+	}
 	if view.narrow() {
 		value = c.extractRegister(value, view)
 	}
@@ -662,12 +757,19 @@ func (c *converter) emitRegisterWrite(instruction core.Instruction) {
 		}
 		mask := c.constantLiteral(view.mask())
 		cleared := c.typedBinOp(ssa.OpAndNot, current, mask, integerType(64))
+		if cleared == nil {
+			c.addDiagnostic("lowir2ssa-partial-write", fmt.Sprintf("cannot clear %s at 0x%x", view.canonical, instruction.Address))
+			return
+		}
 		inserted := value
 		if view.shift > 0 {
 			inserted = c.typedBinOp(ssa.OpShl, inserted, c.constantLiteral(uint64(view.shift)), integerType(64))
 		}
 		inserted = c.typedBinOp(ssa.OpAnd, inserted, mask, integerType(64))
 		value = c.typedBinOp(ssa.OpOr, cleared, inserted, integerType(64))
+	}
+	if value == nil {
+		return
 	}
 	if value.IsUndefined() {
 		// A variable that holds a placeholder deletes it on the next real write,
@@ -1149,58 +1251,61 @@ func constInteger(constant *ssa.ConstInst) (int64, bool) {
 	return 0, false
 }
 
+// compareCondition turns one architecture condition code into a comparison of the
+// two operands the flags value was computed from.
 func (c *converter) compareCondition(cc string, leftID, rightID core.ValueID) ssa.Value {
 	left := c.values[leftID]
 	right := c.values[rightID]
 	if left == nil || right == nil {
 		return nil
 	}
-	var op ssa.BinaryOpcode
-	switch cc {
-	case "e", "eq", "z":
-		op = ssa.OpEq
-	case "ne", "nz":
-		op = ssa.OpNotEq
-	case "l", "lt", "b", "c", "cc", "lo":
-		op = ssa.OpLt
-	case "le", "be", "ls":
-		op = ssa.OpLtEq
-	case "g", "gt", "a", "hi":
-		op = ssa.OpGt
-	case "ge", "ae", "cs", "hs":
-		op = ssa.OpGtEq
-	default:
+	condition, ok := core.ParseCondition(cc)
+	if !ok {
 		return nil
 	}
-	return c.builder.EmitBinOp(op, left, right)
+	switch condition.Op {
+	case core.CompareEQ:
+		return c.builder.EmitBinOp(ssa.OpEq, left, right)
+	case core.CompareNE:
+		return c.builder.EmitBinOp(ssa.OpNotEq, left, right)
+	case core.CompareLT:
+		return c.orderedCompareSource(ssa.OpLt, left, right, condition.Signed)
+	case core.CompareLE:
+		return c.orderedCompareSource(ssa.OpLtEq, left, right, condition.Signed)
+	case core.CompareGT:
+		return c.orderedCompareSource(ssa.OpGt, left, right, condition.Signed)
+	case core.CompareGE:
+		return c.orderedCompareSource(ssa.OpGtEq, left, right, condition.Signed)
+	}
+	return nil
 }
 
+// zeroCondition turns one condition code into a comparison against zero. A target
+// that tests one operand instead of comparing two reaches this form.
 func (c *converter) zeroCondition(cc string, subject ssa.Value) ssa.Value {
 	if subject == nil {
 		return nil
 	}
-	zero := c.newConstant(int64(0), c.typeFor(integerType(64)))
-	switch cc {
-	case "e", "eq", "z":
-		return c.builder.EmitBinOp(ssa.OpEq, subject, zero)
-	case "ne", "nz":
-		return c.builder.EmitBinOp(ssa.OpNotEq, subject, zero)
-	case "l", "lt", "b", "c", "cc", "lo":
-		return c.builder.EmitBinOp(ssa.OpLt, subject, zero)
-	case "le", "be", "ls":
-		return c.builder.EmitBinOp(ssa.OpLtEq, subject, zero)
-	case "g", "gt", "a", "hi":
-		return c.builder.EmitBinOp(ssa.OpGt, subject, zero)
-	case "ge", "ae", "cs", "hs":
-		return c.builder.EmitBinOp(ssa.OpGtEq, subject, zero)
-	case "s", "mi":
-		return c.builder.EmitBinOp(ssa.OpLt, subject, zero)
-	case "ns", "pl":
-		less := c.builder.EmitBinOp(ssa.OpLt, subject, zero)
-		return c.builder.EmitUnOp(ssa.OpNot, less)
-	default:
+	condition, ok := core.ParseCondition(cc)
+	if !ok {
 		return nil
 	}
+	zero := c.newConstant(int64(0), c.typeFor(integerType(64)))
+	switch condition.Op {
+	case core.CompareEQ:
+		return c.builder.EmitBinOp(ssa.OpEq, subject, zero)
+	case core.CompareNE:
+		return c.builder.EmitBinOp(ssa.OpNotEq, subject, zero)
+	case core.CompareLT:
+		return c.orderedCompareSource(ssa.OpLt, subject, zero, condition.Signed)
+	case core.CompareLE:
+		return c.orderedCompareSource(ssa.OpLtEq, subject, zero, condition.Signed)
+	case core.CompareGT:
+		return c.orderedCompareSource(ssa.OpGt, subject, zero, condition.Signed)
+	case core.CompareGE:
+		return c.orderedCompareSource(ssa.OpGtEq, subject, zero, condition.Signed)
+	}
+	return nil
 }
 
 // opaqueValue represents a value whose exact semantics are not modeled. It is a
@@ -1222,7 +1327,62 @@ func (c *converter) emitWidthCast(instruction core.Instruction) {
 	if value == nil || len(instruction.Results) == 0 {
 		return
 	}
-	c.setResult(instruction, c.castType(value, c.typeFor(instruction.Results[0].Type)))
+	destination := instruction.Results[0].Type.Bits
+	if destination == 0 {
+		destination = widthOfSSAType(c.typeFor(instruction.Results[0].Type))
+	}
+	source := c.operandWidth(firstOperand(instruction.Operands), 0)
+	if source == 0 {
+		source = widthOfSSAType(value.GetType())
+	}
+	switch instruction.Kind {
+	case core.OpSignExtend:
+		if constant, ok := ssa.ToConstInst(value); ok {
+			if number, ok := signedConstant(constant, source); ok {
+				folded := c.builder.EmitConstInst(number)
+				if folded != nil {
+					c.setResult(instruction, folded)
+					folded.SetType(c.signedTypeFor(destination))
+				}
+				return
+			}
+		}
+		// The intermediate cast is what makes the target C expression sign-extend:
+		// (int64_t)(int32_t)x keeps the sign bit, (int64_t)x on a uint32_t does not.
+		value = c.castType(value, c.signedTypeFor(source))
+		value = c.castType(value, c.signedTypeFor(destination))
+		c.setResult(instruction, value)
+		value.SetType(c.signedTypeFor(destination))
+	case core.OpZeroExtend:
+		if constant, ok := ssa.ToConstInst(value); ok {
+			if number, ok := unsignedConstant(constant, source); ok {
+				folded := c.builder.EmitConstInst(number)
+				if folded != nil {
+					c.setResult(instruction, folded)
+					folded.SetType(c.typeFor(instruction.Results[0].Type))
+				}
+				return
+			}
+		}
+		value = c.castType(value, c.typeFor(integerType(source)))
+		value = c.castType(value, c.typeFor(integerType(destination)))
+		c.setResult(instruction, value)
+	case core.OpTruncate:
+		if constant, ok := ssa.ToConstInst(value); ok {
+			if number, ok := unsignedConstant(constant, destination); ok {
+				folded := c.builder.EmitConstInst(number)
+				if folded != nil {
+					c.setResult(instruction, folded)
+					folded.SetType(c.typeFor(instruction.Results[0].Type))
+				}
+				return
+			}
+		}
+		value = c.castType(value, c.typeFor(instruction.Results[0].Type))
+		c.setResult(instruction, value)
+	default:
+		c.setResult(instruction, c.castType(value, c.typeFor(instruction.Results[0].Type)))
+	}
 }
 
 func (c *converter) emitTrap(instruction core.Instruction) {
@@ -1262,25 +1422,39 @@ func (c *converter) emitLoad(instruction core.Instruction) {
 	if variable == nil {
 		return
 	}
-	if c.loopHeaders[c.current] && c.loopCarried[c.current][key] {
-		prefixed := "mem:" + key
-		if phi := c.loopPhi(prefixed, variable); phi != nil {
-			c.setResult(instruction, phi)
+	// A store through another address that may alias this slot invalidates the
+	// cached value, so the load stays a real memory read instead of folding to a
+	// constant.
+	address := instruction.Operands[0]
+	if c.memoryValidAt(key) {
+		if c.loopHeaders[c.current] && slices.Contains(c.loopCarried[c.current], key) {
+			prefixed := "mem:" + key
+			if phi := c.loopPhi(prefixed, variable); phi != nil {
+				c.setResult(instruction, phi)
+				return
+			}
+		}
+		if value := variable.GetValue(); value != nil {
+			c.setResult(instruction, value)
 			return
 		}
 	}
-	if value := variable.GetValue(); value != nil {
-		c.setResult(instruction, value)
-		return
+	// A slot inside the current frame holds the lifter's own scratch space, so a
+	// read of a slot no write filled is a spill that lost its value. Memory
+	// outside the frame belongs to the program and the read stands on its own.
+	op := ssa.UnaryOpcode(ssa.OpLoad)
+	if c.classifyMemorySlot(key, address) == memorySlotFrame {
+		op = ssa.OpSpill
 	}
-	c.setResult(instruction, c.loadMarker(instruction, instruction.Operands[0].Value))
+	c.setResult(instruction, c.emitMemoryRead(instruction, address, op))
 }
 
 func (c *converter) emitStore(instruction core.Instruction) {
 	if len(instruction.Operands) < 2 {
 		return
 	}
-	key := valueKey(c.defs, instruction.Operands[0].Value)
+	address := instruction.Operands[0]
+	key := valueKey(c.defs, address.Value)
 	variable := c.memoryVariable(c.memoryName(key))
 	if variable == nil {
 		return
@@ -1292,24 +1466,11 @@ func (c *converter) emitStore(instruction core.Instruction) {
 	if err := variable.Assign(value); err != nil {
 		c.addDiagnostic("lowir2ssa-assignment", fmt.Sprintf("cannot assign %s: %v", variable.GetName(), err))
 	}
+	c.recordMemoryStore(key, address)
+	if c.classifyMemorySlot(key, address) != memorySlotFrame {
+		c.emitMemoryWrite(instruction, address, value)
+	}
 	c.markHeaderStore("mem:" + key)
-}
-
-func (c *converter) loadMarker(instruction core.Instruction, addressID core.ValueID) ssa.Value {
-	address := c.values[addressID]
-	markerText := "load:unknown"
-	if address != nil {
-		markerText = fmt.Sprintf("load:%d", address.GetId())
-	}
-	marker := c.newConstant(markerText, ssa.CreateStringType())
-	if len(instruction.Results) == 0 {
-		return marker
-	}
-	value := c.castType(marker, c.typeFor(instruction.Results[0].Type))
-	if user, ok := value.(ssa.User); ok && address != nil && value != address {
-		address.AddUser(user)
-	}
-	return value
 }
 
 func (c *converter) markHeaderStore(key string) {
@@ -1354,6 +1515,9 @@ func (c *converter) loopPhi(key string, variable *ssa.Variable) *ssa.Phi {
 	if c.loopPhis[c.current] == nil {
 		c.loopPhis[c.current] = make(map[string]*ssa.Phi)
 	}
+	if _, seen := c.loopPhis[c.current][key]; !seen {
+		c.loopPhiOrder[c.current] = append(c.loopPhiOrder[c.current], loopPhiRef{key: key, phi: phi})
+	}
 	c.loopPhis[c.current][key] = phi
 	return phi
 }
@@ -1367,7 +1531,10 @@ func (c *converter) fillLoopCarried(block core.Block) {
 			if !c.loopHeaders[target] {
 				continue
 			}
-			for key, phi := range c.loopPhis[target] {
+			// The phis follow creation order: filling an edge can create a value for
+			// a block that leaves nothing behind, so map order must not reach it.
+			for _, carried := range c.loopPhiOrder[target] {
+				key, phi := carried.key, carried.phi
 				if c.loopPhiDone[phi.GetId()] {
 					continue
 				}
@@ -1611,6 +1778,9 @@ func (c *converter) setResult(instruction core.Instruction, value ssa.Value) {
 	if c.isStackDerived(instruction) {
 		c.spDerived[value] = true
 	}
+	if c.isFramePointerDerived(instruction) {
+		c.frameDerived[value] = true
+	}
 	// A copy of a frame register is still that register: the prologue saves the
 	// frame pointer through a copy, and that value is not an argument.
 	if instruction.Kind == core.OpCopy && len(instruction.Operands) > 0 {
@@ -1640,7 +1810,19 @@ func (v registerView) narrow() bool {
 }
 
 func (v registerView) partial() bool {
-	return v.canonicalBits > 0 && v.width > 0 && v.width < 32
+	// A write narrower than 32 bits merges with the value already in the
+	// canonical variable, because x86 leaves the upper bits untouched. A
+	// 32-bit write zero-extends instead, and on a 16-bit target the 16-bit
+	// register is the whole variable, so neither is partial. A view with no
+	// canonical width (the flags pseudo register) is also a whole variable.
+	if v.canonicalBits == 0 {
+		return false
+	}
+	limit := uint16(32)
+	if v.canonicalBits < limit {
+		limit = v.canonicalBits
+	}
+	return v.width > 0 && v.width < limit
 }
 
 func (v registerView) mask() uint64 {
@@ -1667,24 +1849,34 @@ func registerViewFor(name string, bits uint16, model core.RegisterModel) registe
 		// A flag word is not an integer register, so its width is declared rather
 		// than derived from the machine width. x86 keeps one variable for the
 		// flags word across the 32-bit and 64-bit spellings.
+		//
+		// A flag write replaces the whole word even when the word is narrower than
+		// a general register (s390x cc is two bits). Reporting a bit width as a
+		// canonical width would turn every flag write into a partial write that
+		// merges with the previous value, which erases the comparison the flags
+		// value carries.
 		width := model.FlagsWidth
 		if width == 0 {
 			width = model.Width
 		}
 		canonical := lower
+		view := registerView{canonical: canonical, width: width}
 		if model.Naming == core.RegisterNamingX86 {
-			canonical = "rflags"
+			// The x86 flags word is one 64-bit variable in every mode, so the
+			// test that pins the name also pins the canonical width.
+			view.canonical = "rflags"
+			view.canonicalBits = width
 		}
-		return registerView{canonical: canonical, width: width, canonicalBits: width}
+		return view
 	}
 	switch model.Naming {
 	case core.RegisterNamingX86:
 		// The canonical variable is as wide as the target's registers. A 32-bit
 		// target keeps eax and ax in one 32-bit variable, so a read must not
 		// extract from a 64-bit one and lose the constant.
-		return x86RegisterView(lower, bits, model.Width)
+		return x86RegisterView(model, lower, bits)
 	case core.RegisterNamingAArch64:
-		return aarch64RegisterView(lower, bits, model.Width)
+		return aarch64RegisterView(model, lower, bits, model.Width)
 	default:
 		width := bits
 		if width == 0 {
@@ -1695,22 +1887,11 @@ func registerViewFor(name string, bits uint16, model core.RegisterModel) registe
 }
 
 // x86RegisterView maps one x86 register name, including the partial views, to the
-// 64-bit variable that holds it.
-func x86RegisterView(lower string, bits, canonicalBits uint16) registerView {
+// variable that holds it. The alias rule comes from the register model.
+func x86RegisterView(model core.RegisterModel, lower string, bits uint16) registerView {
+	canonicalBits := model.Width
 	if canonicalBits == 0 {
 		canonicalBits = 64
-	}
-	if family, ok := generalRegisterFamily(lower); ok {
-		width := bits
-		if width == 0 {
-			width = generalRegisterWidth(lower)
-		}
-		return registerView{
-			canonical:     family,
-			width:         width,
-			shift:         generalRegisterShift(lower),
-			canonicalBits: canonicalBits,
-		}
 	}
 	switch {
 	case strings.HasPrefix(lower, "xmm"), strings.HasPrefix(lower, "ymm"), strings.HasPrefix(lower, "zmm"):
@@ -1723,166 +1904,38 @@ func x86RegisterView(lower string, bits, canonicalBits uint16) registerView {
 		// The flags pseudo register is one opaque word regardless of the
 		// machine width, so a 32-bit write must not become a partial write.
 		return registerView{canonical: "rflags", width: 64, canonicalBits: 64}
-	default:
+	}
+	alias, ok := model.AliasOf(lower)
+	if !ok {
 		return registerView{canonical: lower, width: bits}
+	}
+	width := bits
+	if width == 0 {
+		width = alias.Width
+	}
+	return registerView{
+		canonical:     alias.Name,
+		width:         width,
+		shift:         alias.Shift,
+		canonicalBits: canonicalBits,
 	}
 }
 
 // aarch64RegisterView shares one variable between a W register and its X
-// counterpart, and between SP and WSP.
-func aarch64RegisterView(lower string, bits, defaultBits uint16) registerView {
-	switch lower {
-	case "wsp", "sp":
-		return registerView{canonical: "sp", width: 64, canonicalBits: 64}
-	case "wzr", "xzr":
-		return registerView{canonical: "xzr", width: 64, canonicalBits: 64}
-	case "fp":
-		return registerView{canonical: "x29", width: 64, canonicalBits: 64}
-	case "lr":
-		return registerView{canonical: "x30", width: 64, canonicalBits: 64}
-	}
-	digits, ok := registerDigits(lower[1:])
-	if !ok || len(lower) < 2 || (lower[0] != 'w' && lower[0] != 'x') {
+// counterpart, and between SP and WSP. The alias rule comes from the register
+// model.
+func aarch64RegisterView(model core.RegisterModel, lower string, bits, defaultBits uint16) registerView {
+	alias, ok := model.AliasOf(lower)
+	if !ok {
 		width := bits
 		if width == 0 {
 			width = defaultBits
 		}
 		return registerView{canonical: lower, width: width, canonicalBits: width}
 	}
-	width := uint16(64)
-	if lower[0] == 'w' {
-		width = 32
-	}
-	return registerView{canonical: "x" + digits, width: width, canonicalBits: 64}
-}
-
-func generalRegisterFamily(name string) (string, bool) {
-	// AArch64: Wn shares variable Xn; SP and WSP are one variable.
-	if len(name) >= 2 && (name[0] == 'w' || name[0] == 'x') {
-		if digits, ok := registerDigits(name[1:]); ok {
-			return "x" + digits, true
-		}
-	}
-	switch name {
-	case "wsp", "sp":
-		return "sp", true
-	case "wzr", "xzr":
-		return "xzr", true
-	case "fp":
-		return "x29", true
-	case "lr":
-		return "x30", true
-	}
-	switch name {
-	case "al", "ah", "ax", "eax", "rax":
-		return "rax", true
-	case "bl", "bh", "bx", "ebx", "rbx":
-		return "rbx", true
-	case "cl", "ch", "cx", "ecx", "rcx":
-		return "rcx", true
-	case "dl", "dh", "dx", "edx", "rdx":
-		return "rdx", true
-	case "sil", "si", "esi", "rsi":
-		return "rsi", true
-	case "dil", "di", "edi", "rdi":
-		return "rdi", true
-	case "bpl", "bp", "ebp", "rbp":
-		return "rbp", true
-	case "spl", "sp", "esp", "rsp":
-		return "rsp", true
-	case "rip":
-		return "rip", true
-	}
-	if len(name) < 2 || name[0] != 'r' || name[1] < '1' || name[1] > '9' {
-		return "", false
-	}
-	digits := name[1:]
-	if last := digits[len(digits)-1]; len(digits) > 1 && (last == 'b' || last == 'w' || last == 'd' || last == 'l') {
-		digits = digits[:len(digits)-1]
-	}
-	if digits == "" {
-		return "", false
-	}
-	for _, digit := range digits {
-		if digit < '0' || digit > '9' {
-			return "", false
-		}
-	}
-	return "r" + digits, true
-}
-
-func registerDigits(text string) (string, bool) {
-	if text == "" {
-		return "", false
-	}
-	for _, digit := range text {
-		if digit < '0' || digit > '9' {
-			return "", false
-		}
-	}
-	return text, true
-}
-
-func generalRegisterWidth(name string) uint16 {
-	switch name {
-	case "eax", "ebx", "ecx", "edx", "esi", "edi", "esp", "ebp":
-		return 32
-	case "ax", "bx", "cx", "dx", "si", "di", "sp", "bp":
-		return 16
-	case "al", "bl", "cl", "dl", "ah", "bh", "ch", "dh":
-		return 8
-	}
-	// AArch64 W registers are the 32-bit view of an X register.
-	if len(name) >= 2 && name[0] == 'w' && name != "wsp" {
-		if _, ok := registerDigits(name[1:]); ok {
-			return 32
-		}
-	}
-	if name == "wsp" {
-		return 32
-	}
-	if name == "xzr" || name == "sp" || name[0] == 'x' {
-		if name == "xzr" || name == "sp" {
-			return 64
-		}
-		if _, ok := registerDigits(name[1:]); ok {
-			return 64
-		}
-	}
-	switch name {
-	case "ah", "bh", "ch", "dh":
-		return 8
-	}
-	// x86asm names the 32-bit extended registers r8l..r15l.
-	if len(name) > 2 && name[0] == 'r' && name[1] >= '1' && name[1] <= '9' {
-		switch name[len(name)-1] {
-		case 'b':
-			return 8
-		case 'w':
-			return 16
-		case 'd', 'l':
-			return 32
-		}
-	}
-	switch {
-	case strings.HasSuffix(name, "b"), strings.HasSuffix(name, "l"):
-		return 8
-	case strings.HasSuffix(name, "w"):
-		return 16
-	case strings.HasSuffix(name, "d"):
-		return 32
-	default:
-		return 64
-	}
-}
-
-func generalRegisterShift(name string) uint16 {
-	switch name {
-	case "ah", "bh", "ch", "dh":
-		return 8
-	default:
-		return 0
-	}
+	// The name fixes the width: the disassembly reports the width of the operand
+	// type, which is the width of the whole register for a W view.
+	return registerView{canonical: alias.Name, width: alias.Width, canonicalBits: 64}
 }
 
 func functionName(function core.Function) string {
@@ -1953,6 +2006,26 @@ func (c *converter) isStackDerived(instruction core.Instruction) bool {
 			continue
 		}
 		if value, ok := c.values[operand.Value]; ok && c.spDerived[value] {
+			return true
+		}
+	}
+	return false
+}
+
+// isFramePointerDerived reports whether one operation builds an address from the
+// frame pointer in the same way. Only pointer arithmetic propagates the
+// property: a value loaded from a frame slot is data, not an address.
+func (c *converter) isFramePointerDerived(instruction core.Instruction) bool {
+	switch instruction.Kind {
+	case core.OpAdd, core.OpSub, core.OpShl, core.OpCopy, core.OpAnd:
+	default:
+		return false
+	}
+	for _, operand := range instruction.Operands {
+		if operand.Kind != core.OperandValue {
+			continue
+		}
+		if value, ok := c.values[operand.Value]; ok && (c.spDerived[value] || c.frameDerived[value]) {
 			return true
 		}
 	}

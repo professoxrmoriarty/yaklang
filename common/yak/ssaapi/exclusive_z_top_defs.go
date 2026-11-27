@@ -756,7 +756,11 @@ func (i *Value) getTopDefs(actx *AnalyzeContext, opt ...OperationOption) (result
 				}
 			} else {
 				// parameter
-				if inst.FormalParameterIndex >= len(calledInstance.Args) {
+				// A shell call stores its positional vector in a call binding;
+				// resolve the variadic formal to that vector, not a flat Args slot.
+				if pack, ok := calledInstance.PackedVariadic(inst.FormalParameterIndex); ok {
+					actualParam = pack
+				} else if inst.FormalParameterIndex >= len(calledInstance.Args) {
 					// Optional parameters keep their declared default on the formal.
 					// A call intentionally omits trailing optional arguments, so an
 					// out-of-range formal is not necessarily a broken call vector.

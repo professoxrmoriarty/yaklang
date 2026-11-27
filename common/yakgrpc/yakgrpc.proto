@@ -474,6 +474,7 @@ service Yak {
   rpc NewRiskRead(NewRiskReadRequest) returns (Empty);
   // 风险漏洞自动同步
   rpc UploadRiskToOnline(UploadRiskToOnlineRequest) returns (Empty);
+  rpc UploadRiskToOnlineBatch(UploadRiskToOnlineBatchRequest) returns (UploadRiskToOnlineBatchResponse);
   rpc SetTagForRisk(SetTagForRiskRequest) returns (Empty);
   rpc QueryRiskTags(Empty) returns (QueryRiskTagsResponse);
   rpc RiskFieldGroup(Empty) returns (RiskFieldGroupResponse);
@@ -746,11 +747,29 @@ service Yak {
 
   // Wireshark
   rpc GetPcapMetadata(PcapMetadataRequest) returns (PcapMetadata);
+  // Start one persistent pcapdb live capture. The first response carries
+  // DatasetID, which can be queried while capture is running.
   rpc PcapX(stream PcapXRequest) returns (stream PcapXResponse);
+  // Deprecated: compatibility shell only; returns Unimplemented.
+  // New code should use the pcapdb DatasetID APIs.
   rpc QueryTrafficSession(QueryTrafficSessionRequest) returns (QueryTrafficSessionResponse);
+  // Deprecated: compatibility shell only; returns Unimplemented.
+  // Use QueryPCAPPackets and GetPCAPPacketDetail instead.
   rpc QueryTrafficPacket(QueryTrafficPacketRequest) returns (QueryTrafficPacketResponse);
+  // Deprecated: compatibility shell only; returns Unimplemented.
   rpc QueryTrafficTCPReassembled(QueryTrafficTCPReassembledRequest) returns (QueryTrafficTCPReassembledResponse);
+  // Deprecated: compatibility shell only; returns Unimplemented.
+  // Use GetPCAPPacketDetail instead.
   rpc ParseTraffic(ParseTrafficRequest) returns (ParseTrafficResponse);
+
+  // Offline capture library (packet viewing).
+  rpc ImportPCAPFile(ImportPCAPFileRequest) returns (stream ImportPCAPFileResponse);
+  rpc QueryPCAPDatabase(QueryPCAPDatabaseRequest) returns (QueryPCAPDatabaseResponse);
+  rpc QueryPCAPPackets(QueryPCAPPacketsRequest) returns (QueryPCAPPacketsResponse);
+  rpc GetPCAPPacketDetail(GetPCAPPacketDetailRequest) returns (PCAPPacketDetail);
+  rpc ReadPCAPBytes(ReadPCAPBytesRequest) returns (ReadPCAPBytesResponse);
+  rpc ExportPCAPData(ExportPCAPDataRequest) returns (ExportPCAPDataResponse);
+  rpc DeletePCAPDatabase(DeletePCAPDatabaseRequest) returns (DeletePCAPDatabaseResponse);
 
   // 与前端交互的双工长连接，用于通知某些消息
   rpc DuplexConnection(stream DuplexConnectionRequest) returns (stream DuplexConnectionResponse);
@@ -779,6 +798,7 @@ service Yak {
   rpc ListAiModel(ListAiModelRequest) returns (ListAiModelResponse);
   rpc AIConfigHealthCheck(AIConfigHealthCheckRequest) returns (AIConfigHealthCheckResponse);
   rpc ProbeReasoningEffort(ProbeReasoningEffortRequest) returns (ProbeReasoningEffortResponse);
+  rpc ProbeModelVision(ProbeModelVisionRequest) returns (ProbeModelVisionResponse);
   rpc GetAIGlobalConfig(Empty) returns (AIGlobalConfig);
   rpc SetAIGlobalConfig(AIGlobalConfig) returns (Empty);
   rpc ListAIProviders(Empty) returns (ListAIProvidersResponse);
@@ -944,6 +964,7 @@ service Yak {
 
   // AI Task
   rpc StartAIReAct(stream AIInputEvent) returns(stream AIOutputEvent);
+  rpc ReadAIImage(AIImageRequest) returns(AIImageResponse);
   rpc StartAITask(stream AIInputEvent) returns(stream AIOutputEvent);
   rpc QueryAITask(AITaskQueryRequest) returns (AITaskQueryResponse);
   rpc DeleteAITask(AITaskDeleteRequest) returns (DbOperateMessage);
@@ -1140,6 +1161,11 @@ service Yak {
   // Query resources attached by the latest input and the distinct resources
   // attached throughout an AI session.
   rpc GetAISessionCurrentResources(GetAISessionCurrentResourcesRequest) returns (GetAISessionCurrentResourcesResponse);
+  // Model-specific compression budgets, available before a session starts.
+  rpc GetAIModelContext(GetAIModelContextRequest) returns (AIModelContextResponse);
+  rpc SetAIModelContext(SetAIModelContextRequest) returns (AIModelContextResponse);
+
+
 }
 
 // IMBotConfig 描述一个 IM 平台 bot 的配置凭证。
@@ -2317,6 +2343,9 @@ message AIStartParams {
   // >0 时覆盖服务端默认阈值；<=0（含前端不传）时使用服务端默认值，保证携带运行时
   // 上下文的时间线不会被过早压缩。
   int64 RuntimeContextSizeLimit = 51;
+  // Model-scoped hotpatch only; absent preserves the saved automatic adjustment preference.
+  optional bool DisableContextAutoAdjust = 56;
+  string ModelContextKey = 55;
 
   // 用户交互的最大次数限制,超过这个次数，AI 将不再被允许问用户问题
   int64 UserInteractLimit = 30;
@@ -2375,6 +2404,7 @@ message AIStartParams {
   optional bool NetworkDebug = 52;
   // Connection-local, build-generated component catalog and interaction capabilities.
   string ClientUI = 53;
+	AIImageInputConfig ImageInput = 54;
 }
 
 message AIExecutionStrategy {
@@ -2388,14 +2418,15 @@ message AIExecutionStrategy {
   // 避免“做一点就汇报然后结束”。
   bool EnableGoalMode = 2;
 
-  // Goal 模式下允许 finish 的最小迭代次数。<=0 时由服务端使用默认值。
+  // Goal 模式下允许 finish 的最小迭代次数。0 关闭迭代门禁；不能为负数。
+  // Strategy 一旦传入即完整替换旧策略，0/false/空字符串用于清除旧模式配置。
   int64 GoalMinIterations = 3;
 
   // Multi 模式下子 Agent 最大并发数（同时运行数量）。
   // <=0 时由服务端使用默认值 5；超过 AbsoluteMaxSubAgentConcurrency(20) 时由服务端钳制。
   int64 MaxSubAgents = 4;
 
-  // Goal 模式时间窗口（秒）。>0 时在时间窗口内无条件拒绝 finish；-1 表示永不自动放行。
+  // Goal 模式时间窗口（秒）。>0 时从配置生效立即计时，到期前拒绝 finish；-1 表示永不自动放行。
   // 0 或省略表示不启用时间窗口 gate，仅依赖迭代数和验收条件。
   // 该字段是声明式配置；运行时延长或缩短当前 deadline 请使用 AIInputEvent.GoalTimePatch。
   int64 GoalDurationSeconds = 5;
@@ -3203,10 +3234,17 @@ message QueryTrafficSessionRequest {
 }
 
 message PcapXRequest {
-  // first request
+  // First request. Exactly one interface is supported in this phase.
   repeated string NetInterfaceList = 1;
+  // Deprecated: unused compatibility field. Use DurationMilliseconds.
   double TimeoutFloat = 2;
   SuricataConfig SuricataLoader = 3;
+  string BPF = 4;
+  int32 Snaplen = 5;
+  bool Promisc = 6;
+  int64 BatchSize = 7;
+  int64 FlushIntervalMilliseconds = 8;
+  int64 DurationMilliseconds = 9;
 }
 
 message SuricataConfig {
@@ -3218,6 +3256,9 @@ message PcapXResponse {
   int64 NetInterfaceTransferKBPerSeconds = 2;
   int64 TCPReassembledCount = 3;
   int64 TrafficSessionCount = 4;
+  PCAPDatabase Database = 5;
+  bool Finished = 6;
+  string Error = 7;
 }
 
 
@@ -5565,6 +5606,16 @@ message UploadRiskToOnlineRequest {
   repeated string Hash = 3;
   string ExternalModule = 4;
   string ExternalProjectCode = 5;
+}
+
+message UploadRiskToOnlineBatchRequest {
+  UploadRiskToOnlineRequest ToOnlineWhere = 1;
+  QueryRisksRequest UploadRisksWhere = 2;
+}
+
+message UploadRiskToOnlineBatchResponse {
+  int64 SuccessCount = 1;
+  int64 FailedCount = 2;
 }
 
 message SetTagForRiskRequest {
@@ -9619,6 +9670,12 @@ message AIModelConfig {
   // 是否已对 xhigh/max 做过探测。false=未探测（首次操作下拉框时触发）；
   // true=已探测（ProbedExtendedEfforts 即最终结果，不再重复探测）。
   bool EffortProbed = 7;
+  // Unset means unknown, not false. Auto mode uses separate vision for unknown models.
+  optional bool SupportsImageInput = 8;
+  string ImageTokenEstimator = 9; // conservative (default), patch32, tile512
+  optional bool SupportsImageToolCalling = 10; // Unset means unknown.
+  // Stable owner for this configured provider entry, independent of the selected model.
+  string ContextOwnerId = 11;
 }
 
 message AIGlobalConfig {
@@ -10692,6 +10749,32 @@ message HTTPPreviewResourceResponse {
   bytes Data = 3;
 }
 
+// Session image policy. Zero limits use bounded server defaults.
+message AIImageInputConfig {
+  string Mode = 1; // auto (default), native, describe
+  optional bool MainModelSupportsImages = 2; // override for custom callbacks
+  // Legacy compatibility only; image retention now follows Timeline.
+  int64 MaxActiveImages = 3;
+  int64 VisualTokenLimit = 4;
+  int64 MaxLongEdge = 5;
+  int64 OutputReserveTokens = 6;
+  int64 MaxRequestBytes = 7;
+}
+
+message AIImageRequest {
+  string SessionID = 1;
+  string ImageID = 2; // resource ID or content ID, scoped to this session
+  string Variant = 3; // thumbnail (default), original; model is a legacy overview alias
+  string Scope = 4; // optional child-agent namespace, owned by SessionID
+}
+message AIImageResponse {
+  bytes Data = 1;
+  string MIMEType = 2;
+  int64 Width = 3;
+  int64 Height = 4;
+  string ImageID = 5;
+}
+
 message QueryAIToolRequest {
   AIToolFilter Filter = 1;
   Paging Pagination = 2;
@@ -10733,6 +10816,12 @@ enum AIGoalTimeAction {
   AI_GOAL_TIME_ACTION_DISABLE = 3;
   // Keep the goal time-window gate open indefinitely.
   AI_GOAL_TIME_ACTION_NEVER_ENDING = 4;
+  // Start a fresh window of DurationSeconds from now, replacing whatever the
+  // current window was. This is the only action that moves a disabled or
+  // never-ending window back to a finite one; SET_DEADLINE cannot express that
+  // intent without also rewriting the duration. DurationSeconds must be
+  // positive; use DISABLE or NEVER_ENDING for those two states.
+  AI_GOAL_TIME_ACTION_SET_DURATION = 5;
 }
 
 message AIGoalTimePatch {
@@ -10741,4 +10830,247 @@ message AIGoalTimePatch {
   int64 ExtendSeconds = 2;
   // Absolute Unix timestamp for AI_GOAL_TIME_ACTION_SET_DEADLINE.
   int64 DeadlineUnix = 3;
+  // Window length in seconds for AI_GOAL_TIME_ACTION_SET_DURATION.
+  // Must be positive; -1 and 0 have dedicated actions.
+  int64 DurationSeconds = 4;
+}
+
+message ProbeModelVisionRequest {
+  ThirdPartyApplicationConfig Config = 1;
+  string Model = 2;
+}
+
+message ProbeModelVisionResponse {
+  optional bool SupportsImageInput = 1;
+  optional bool SupportsImageToolCalling = 2;
+  string ImageInputStatus = 3;
+  string ImageToolCallingStatus = 4;
+}
+
+message GetAIModelContextRequest {
+  string Provider = 1;
+  string Model = 2;
+  AIModelConfig Config = 3;
+  string ContextKey = 4;
+}
+
+message SetAIModelContextRequest {
+  string Provider = 1;
+  string Model = 2;
+  int64 ThresholdTokens = 3;
+  // Presence allows switching modes without changing a learned threshold below the manual floor.
+  optional bool DisableAutoAdjust = 4;
+  AIModelConfig Config = 5;
+  string ContextKey = 6;
+}
+
+message AIModelContextResponse {
+  reserved 3, 7;
+  string Provider = 1;
+  string Model = 2;
+  int64 ThresholdTokens = 4;
+  string Source = 5;
+  int64 MinimumThresholdTokens = 6;
+  bool DisableAutoAdjust = 8;
+  string ContextKey = 9;
+}
+
+message PCAPDatabase {
+  int64 Id = 1; // Catalog row ID. Use DatasetID for subsequent operations.
+  string DatasetID = 2;
+  string SourcePath = 3;
+  int64 SourceSize = 4;
+  string Format = 5;
+  string State = 6;
+  int64 PacketCount = 7;
+  string LastError = 8;
+  bool PreviewTruncated = 9;
+  bool ProtocolsIndexed = 10;
+  string SourceKind = 11; // file or live.
+  string CaptureInterface = 12; // Selected live capture interface; empty for file imports.
+  string CaptureBPF = 13; // Live capture BPF; empty when no filter was configured.
+  int64 ProtocolCount = 14;
+  int64 SessionCount = 15;
+  int64 StreamCount = 16;
+  int64 StreamChunkCount = 17;
+  bool StreamsIndexed = 18;
+  int64 CreatedAt = 19; // Dataset creation time as Unix seconds.
+}
+
+message ImportPCAPFileRequest {
+  string InputFile = 1; // Path on the engine; indexes original packets and protocol messages, not streams.
+}
+
+message ImportPCAPFileResponse {
+  string DatasetID = 1;
+  string State = 2;
+  int64 BytesIndexed = 3;
+  int64 TotalBytes = 4;
+  int64 PacketCount = 5;
+  bool Finished = 6; // Final successful event, also sent when reusing an existing dataset.
+  PCAPDatabase Database = 7;
+}
+
+message PCAPDatabaseFilter {
+  string DatasetID = 1; // Exact canonical ID. Empty lists all registered datasets.
+}
+
+message QueryPCAPDatabaseRequest {
+  PCAPDatabaseFilter Filter = 1;
+  Paging Pagination = 2; // Limit and AfterId, ID ascending. Page is omitted or 1.
+}
+
+message QueryPCAPDatabaseResponse {
+  Paging Pagination = 1; // Normalized request paging; AfterId is the next cursor.
+  repeated PCAPDatabase Data = 2;
+  int64 Total = 3; // Matching catalog entries before applying AfterId.
+}
+
+message PCAPPacketsFilter {
+  int64 Id = 1; // Exact original packet ID; zero disables the ID predicate.
+  repeated string SourceIP = 2; // OR within this field; canonical IPv4/IPv6.
+  repeated string DestinationIP = 3;
+  repeated int32 SourcePort = 4; // Port zero is a valid exact value.
+  repeated int32 DestinationPort = 5;
+  repeated string TransportLayerTypes = 6; // Case-insensitive, for example tcp or udp.
+  repeated string ApplicationLayerTypes = 7; // Completion-frame semantics, for example http.
+  repeated string LinkLayerTypes = 8; // Names or numeric DLT values.
+  repeated string NetworkLayerTypes = 9; // ipv4 or ipv6.
+  optional int64 StartTimestampNS = 10;
+  optional int64 EndTimestampNS = 11; // Exclusive: [StartTimestampNS, EndTimestampNS).
+  string Keyword = 12; // Literal endpoint/transport/packet summary/message summary substring.
+}
+
+message PCAPPacketSummary {
+  int64 Id = 1;
+  optional int64 TimestampNS = 2;
+  int64 CapturedLength = 3;
+  int64 OriginalLength = 4;
+  int64 LinkType = 5;
+  int64 Section = 6;
+  int64 Interface = 7;
+  string SourceMAC = 8;
+  string DestinationMAC = 9;
+  string VLANStack = 10;
+  string SourceIP = 11;
+  string DestinationIP = 12;
+  int32 SourcePort = 13;
+  int32 DestinationPort = 14;
+  string Transport = 15;
+  string Protocol = 16; // Effective protocol shown in the packet-list Protocol column.
+  repeated string ApplicationProtocols = 17; // Completed by this frame.
+  string Info = 18; // Bounded summary shown in the packet-list Info column.
+  string DecodeError = 19;
+}
+
+message QueryPCAPPacketsRequest {
+  string DatasetID = 1;
+  PCAPPacketsFilter Filter = 2;
+  Paging Pagination = 3; // ID ascending, AfterId + Limit only; Limit defaults to 100, max 1000.
+  // Absent: count the first page/cursor origin and skip later cursor pages.
+  // True: count every page. False: do not count.
+  optional bool IncludeTotal = 4;
+}
+
+message QueryPCAPPacketsResponse {
+  Paging Pagination = 1; // Normalized request paging; AfterId is the next cursor.
+  repeated PCAPPacketSummary Data = 2;
+  optional int64 Total = 3; // Exact matching packet count; absent when not computed.
+}
+
+message PCAPFieldRange {
+  string SourceID = 1; // frame:<id> or message:<id>.
+  int64 BitOffset = 2; // Bits from the beginning of SourceID.
+  int64 BitLength = 3;
+}
+
+message PCAPFieldNode {
+  string Name = 1;
+  optional string DisplayValue = 2; // Absent for a pure container node.
+  repeated PCAPFieldNode Children = 3;
+  repeated PCAPFieldRange Ranges = 4; // Empty when no reliable wire span is known.
+}
+
+message PCAPByteSource {
+  string ID = 1;
+  string Kind = 2; // frame or message.
+  string Name = 3;
+  int64 Length = 4;
+  string Completeness = 5; // Protocol evidence; independent from EOF.
+  repeated uint64 ContributorPacketIds = 6;
+  uint64 CompletedInPacketId = 7;
+  bytes InitialData = 8; // Bounded prefix; full content is available through ReadPCAPBytes.
+  int64 InitialOffset = 9;
+  bool InitialTruncated = 10; // InitialData does not cover the full source.
+}
+
+message PCAPMessageDetail {
+  uint64 MessageId = 1;
+  string Protocol = 2;
+  string Summary = 3;
+  string Status = 4;
+  string Completeness = 5;
+  string SourceID = 6;
+  repeated PCAPFieldNode Nodes = 7;
+  string DecodeError = 8;
+  bool NodesTruncated = 9; // A detail projection or byte-preview limit prevented full coverage.
+}
+
+message PCAPRelatedMessage {
+  uint64 MessageId = 1;
+  string Protocol = 2;
+  string Summary = 3;
+  string SourceID = 4;
+  uint64 CompletedInPacketId = 5;
+  string Completeness = 6;
+}
+
+message GetPCAPPacketDetailRequest {
+  string DatasetID = 1;
+  int64 PacketID = 2;
+}
+
+message PCAPPacketDetail {
+  PCAPPacketSummary Packet = 1;
+  repeated PCAPFieldNode Nodes = 2; // Original frame tree; ranges use frame:<Packet.Id>.
+  repeated PCAPMessageDetail Messages = 3; // Messages completed in this frame.
+  repeated PCAPRelatedMessage RelatedMessages = 4; // Messages to which this frame contributes.
+  repeated PCAPByteSource ByteSources = 5; // Includes the frame and every completed message.
+}
+
+message ReadPCAPBytesRequest {
+  string DatasetID = 1;
+  string SourceID = 2; // frame:<packet-id> or message:<protocol-message-id>.
+  int64 Offset = 3; // Zero-based byte offset within the selected source.
+  int64 Length = 4; // Requested bytes; capped by the remaining source and server maximum.
+}
+
+message ReadPCAPBytesResponse {
+  bytes Data = 1;
+  int64 Offset = 2; // Offset of Data; echoes the validated request offset.
+  int64 TotalLength = 3;
+  bool EOF = 4; // True when the returned range reaches the selected source's end.
+}
+
+message ExportPCAPDataRequest {
+  string DatasetID = 1;
+  string TargetPath = 2; // Path on the engine; an existing file is never overwritten.
+  int64 PacketID = 3; // Zero: original PCAP/PCAPNG; positive: one packet's raw captured bytes.
+}
+
+message ExportPCAPDataResponse {
+  string Path = 1;
+  int64 Bytes = 2;
+  string SHA256 = 3;
+}
+
+message DeletePCAPDatabaseRequest {
+  string DatasetID = 1; // Exact canonical ID; never accepts a path or catalog row ID.
+}
+
+message DeletePCAPDatabaseResponse {
+  DbOperateMessage Message = 1;
+  bool Deleted = 2;
+  bool CleanupPending = 3;
+  string CleanupError = 4; // Deletion was committed but file cleanup needs retry.
 }

@@ -41,6 +41,9 @@ func (c *converter) planMergePhis(function core.Function) {
 	c.idom = dominators(entry, preds, succs)
 	frontier := dominanceFrontier(preds, c.idom)
 	defs := make(map[string][]core.BlockID)
+	// order keeps the registers in the order the function first writes them, which
+	// fixes phi identifiers without sorting on every walk.
+	var order []string
 	for _, block := range function.Blocks {
 		for _, instruction := range block.Instructions {
 			if instruction.Kind != core.OpWriteRegister || len(instruction.Operands) == 0 {
@@ -54,11 +57,16 @@ func (c *converter) planMergePhis(function core.Function) {
 				continue
 			}
 			key := "reg:" + view.canonical
+			if _, seen := defs[key]; !seen {
+				order = append(order, key)
+			}
 			defs[key] = appendUniqueBlock(defs[key], block.ID)
 		}
 	}
-	for key, blocks := range defs {
-		c.insertMergePhi(key, blocks, frontier)
+	// phi identifiers and the printed text follow that order, so nothing here
+	// depends on map iteration.
+	for _, key := range order {
+		c.insertMergePhi(key, defs[key], frontier)
 	}
 }
 
@@ -98,6 +106,9 @@ func (c *converter) newMergePhi(blockID core.BlockID, key string) *ssa.Phi {
 	target.Phis = append(target.Phis, phi.GetId())
 	if c.mergePhis[blockID] == nil {
 		c.mergePhis[blockID] = make(map[string]*ssa.Phi)
+	}
+	if _, seen := c.mergePhis[blockID][key]; !seen {
+		c.mergePhiOrder[blockID] = append(c.mergePhiOrder[blockID], key)
 	}
 	c.mergePhis[blockID][key] = phi
 	return phi
@@ -145,12 +156,20 @@ func (c *converter) recordRegisterValue(name string, value ssa.Value) {
 // fillMergePhis fills the edge operands once every block is converted, because a
 // phi edge follows the predecessor order the builder recorded.
 func (c *converter) fillMergePhis() {
-	for blockID, phis := range c.mergePhis {
+	// Blocks follow program order and phis follow creation order. Filling an edge
+	// can create a value for a predecessor that leaves nothing behind, and the
+	// order those values are created in decides their identifiers and the printed
+	// text, so neither walk may depend on map iteration.
+	for _, blockID := range c.blockOrder {
+		if len(c.mergePhiOrder[blockID]) == 0 {
+			continue
+		}
 		block := c.blocks[blockID]
 		if block == nil || len(block.Preds) == 0 {
 			continue
 		}
-		for key, phi := range phis {
+		for _, key := range c.mergePhiOrder[blockID] {
+			phi := c.mergePhis[blockID][key]
 			edge := make([]int64, 0, len(block.Preds))
 			var edgeType ssa.Type
 			for _, pred := range block.Preds {

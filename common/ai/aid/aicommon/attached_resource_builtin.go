@@ -15,14 +15,14 @@ import (
 func init() {
 	RegisterAttachedResourceDataFactory(
 		AttachedResourceTypeFile,
-		func() AttachedResourceData { return NewAttachedFileResourceData("") },
+		newAttachedFileResourceData,
 		CONTEXT_PROVIDER_KEY_FILE_PATH,
 		"filepath",
 		"file-path",
 	)
 	RegisterAttachedResourceDataFactory(
 		AttachedResourceTypeKnowledgeBase,
-		func() AttachedResourceData { return &AttachedKnowledgeBaseResourceData{} },
+		newAttachedKnowledgeBaseResourceData,
 		CONTEXT_PROVIDER_TYPE_KNOWLEDGE_BASE,
 	)
 }
@@ -59,9 +59,16 @@ func (d *DefaultAttachedResourceData) Type() string {
 	return d.ResourceType
 }
 
-func (d *DefaultAttachedResourceData) Unmarshal(raw string) error {
-	d.Value = strings.TrimSpace(raw)
-	return nil
+func (d *DefaultAttachedResourceData) DedupKey() string {
+	return attachedResourceDedupKey(d.Type(), d.Key, d.Value)
+}
+
+func newDefaultAttachedResourceData(resource *AttachedResource) (AttachedResourceData, error) {
+	return &DefaultAttachedResourceData{
+		ResourceType: resource.Type,
+		Key:          strings.TrimSpace(resource.Key),
+		Value:        strings.TrimSpace(resource.Value),
+	}, nil
 }
 
 func (d *DefaultAttachedResourceData) BindLoopData(reactloop ReActLoopIF) error {
@@ -116,11 +123,16 @@ func (d *AttachedFileResourceData) Type() string {
 	return AttachedResourceTypeFile
 }
 
-func (d *AttachedFileResourceData) Unmarshal(raw string) error {
-	path := strings.TrimSpace(raw)
+func (d *AttachedFileResourceData) DedupKey() string {
+	return attachedResourceDedupKey(d.Type(), d.Key, d.Path)
+}
+
+func newAttachedFileResourceData(resource *AttachedResource) (AttachedResourceData, error) {
+	path := strings.TrimSpace(resource.Value)
 	if path == "" {
-		return utils.Error("attached file path is empty")
+		return nil, utils.Error("attached file path is empty")
 	}
+	d := NewAttachedFileResourceData(resource.Key)
 	d.Path = path
 	d.MIMEType = attachedFileMIMEType(path)
 
@@ -128,12 +140,12 @@ func (d *AttachedFileResourceData) Unmarshal(raw string) error {
 	if err != nil {
 		d.Kind = AttachedFileKindMissing
 		d.StatError = err.Error()
-		return nil
+		return d, nil
 	}
 	d.Size = info.Size()
 	if info.IsDir() {
 		d.Kind = AttachedFileKindDirectory
-		return nil
+		return d, nil
 	}
 	switch {
 	case IsImageContextAttachmentPath(path):
@@ -143,7 +155,7 @@ func (d *AttachedFileResourceData) Unmarshal(raw string) error {
 	default:
 		d.Kind = AttachedFileKindBinary
 	}
-	return nil
+	return d, nil
 }
 
 func (d *AttachedFileResourceData) BindLoopData(reactloop ReActLoopIF) error {
@@ -203,6 +215,28 @@ func (d *AttachedFileResourceData) ToAttachData(reactloop ReActLoopIF) string {
 
 func (d *AttachedFileResourceData) IsImage() bool {
 	return d != nil && d.Kind == AttachedFileKindImage
+}
+
+// UserPinNotice describes a path attachment without repeating its contents.
+func (d *AttachedFileResourceData) UserPinNotice() string {
+	if d == nil {
+		return ""
+	}
+	path := strings.TrimSpace(d.Path)
+	if path == "" {
+		path = strings.TrimSpace(d.Key)
+	}
+	if path == "" {
+		return ""
+	}
+	switch d.Kind {
+	case AttachedFileKindDirectory:
+		return fmt.Sprintf("User pinned attached directory `%s`.", path)
+	case AttachedFileKindImage:
+		return fmt.Sprintf("User pinned attached image `%s`.", path)
+	default:
+		return fmt.Sprintf("User pinned attached file `%s`.", path)
+	}
 }
 
 func attachedFileMIMEType(path string) string {
@@ -269,13 +303,23 @@ func (d *AttachedKnowledgeBaseResourceData) Type() string {
 	return AttachedResourceTypeKnowledgeBase
 }
 
-func (d *AttachedKnowledgeBaseResourceData) Unmarshal(raw string) error {
-	value := strings.TrimSpace(raw)
+func (d *AttachedKnowledgeBaseResourceData) DedupKey() string {
+	return attachedResourceDedupKey(d.Type(), d.Key, d.Value)
+}
+
+func newAttachedKnowledgeBaseResourceData(resource *AttachedResource) (AttachedResourceData, error) {
+	value := strings.TrimSpace(resource.Value)
 	if value == "" {
-		return utils.Error("attached knowledge base value is empty")
+		return nil, utils.Error("attached knowledge base value is empty")
 	}
-	d.Value = raw
-	return d.content.Unmarshal(raw)
+	return &AttachedKnowledgeBaseResourceData{
+		Key:   resource.Key,
+		Value: resource.Value,
+		content: AttachedFileContentResourceData{
+			Key:     resource.Key,
+			content: resource.Value,
+		},
+	}, nil
 }
 
 func (d *AttachedKnowledgeBaseResourceData) BindLoopData(reactloop ReActLoopIF) error {

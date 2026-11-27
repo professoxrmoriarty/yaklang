@@ -123,9 +123,6 @@ func (r *ReAct) processReActFromQueue() {
 		return
 	}
 
-	cleanupInlineAttachments := installTaskInlineAttachmentProvider(r.config.ContextProviderManager, nextTask)
-	defer cleanupInlineAttachments()
-
 	r.AddRuntimeTask(nextTask)
 	r.setCurrentTask(nextTask)
 	r.persistTaskUserInput(nextTask)
@@ -152,6 +149,11 @@ func (r *ReAct) processReActTask(task aicommon.AIStatefulTask) {
 	}
 	restoreExecutionPolicy := r.applyTaskExecutionPolicy(task)
 	defer restoreExecutionPolicy()
+
+	// A new top-level task owns its own goal time window: restart the window
+	// from GoalDurationSeconds so a previous task's deadline never leaks into
+	// this one. Sub-agents and recovery tasks stay outside goal mode.
+	r.refreshGoalTimeForTask(task)
 
 	skipStatusFallback := utils.NewAtomicBool()
 	defer func() {
@@ -201,6 +203,24 @@ func (r *ReAct) processReActTask(task aicommon.AIStatefulTask) {
 	skipStatusFallback.SetTo(skipStatus)
 	if !skipStatus {
 		r.completeUserTaskMemory(task)
+	}
+}
+
+// refreshGoalTimeForTask restarts the goal time window when a top-level task
+// starts executing. Goal time is task-scoped runtime state: the declared window
+// length lives in Config, but the deadline must belong to the task that is
+// running now. Sub-agents and recovery tasks never enter goal mode, so they
+// must not create or move a window.
+func (r *ReAct) refreshGoalTimeForTask(task aicommon.AIStatefulTask) {
+	if r == nil || r.config == nil || task == nil {
+		return
+	}
+	if task.IsSubAgent() || task.GetTaskKind() == aicommon.AITaskKind_Recovery {
+		return
+	}
+	if r.config.RefreshGoalDeadlineForTask() && r.config.DebugEvent {
+		log.Infof("goal time window restarted for task %s: duration=%ds deadline=%v",
+			task.GetId(), r.config.GetGoalDurationSeconds(), r.config.GetGoalDeadline())
 	}
 }
 
@@ -254,7 +274,6 @@ func (r *ReAct) processRecoveryTask(task aicommon.AIStatefulTask) {
 			r.AddToTimeline("error", fmt.Sprintf("recovery task panic: %v", err))
 		}
 	}()
-
 	data := task.GetRecoveryData()
 	if data == nil {
 		log.Errorf("recovery task %s has no recovery data", task.GetId())
@@ -371,7 +390,7 @@ func (r *ReAct) ExecuteLoopTask(taskTypeName string, task aicommon.AIStatefulTas
 		taskTypeName = "coordinator"
 	}
 	if taskTypeName == "coordinator" {
-		return false, r.invokeCoordinatorChannel(taskTypeName, make(chan struct{}), task.GetContext(), WithInvokePlanAndExecuteTask(task), WithInvokePlanAndExecutePlanPayload(task.GetUserInput()))
+		return false, r.invokeCoordinatorChannel(taskTypeName, make(chan struct{}), task.GetContext(), withCoordinatorInputTask(task))
 	}
 	defaultOptions := reactloops.BasicAICommonConfigOption(r.config)
 	defaultOptions = append(defaultOptions,

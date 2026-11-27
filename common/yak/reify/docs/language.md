@@ -57,7 +57,7 @@ C 层始终以最低置信度命中，因此 `Inspect` 一定返回一个语言�
 
 `Inspect` 在 `Catalog.OpenAs` 校验 Artifact 之后调用，位置见 [loader/catalog.go](../loader/catalog.go)。它先选置信度最高的检测结果，再调用该层的 `Recover`：
 
-- Go：`debug/buildinfo` 读版本；按 `.gopclntab`、`<segment>,__gopclntab` 定位函数表，PE 与外部链接场景回退 `.rdata`、`.data.rel.ro`；用 `debug/gosym` 恢复名字、入口和大小。剥离 `.symtab` 后仍可用。
+- Go：`debug/buildinfo` 读版本；按 `.gopclntab`、`<segment>,__gopclntab` 定位函数表，PE 与外部链接场景回退 `.rdata`、`.data.rel.ro`；用 `debug/gosym` 恢复名字、入口和大小，再用 `ParseInstance` 生成展示名与 `Identity`。剥离 `.symtab` 后仍可用。
 - Rust：识别 v0（`_R`）与 legacy（`_ZN...17h...E`）；`Recover` 把符号表里的编码名改写为可读名，原始名保留在 `Symbol.Mangled`。剥离符号表的 Rust 产物没有名字可恢复，只保留 `.comment` 证据。
 
 `Recover` 返回的符号按 `(名字, 地址)` 合并：
@@ -73,8 +73,8 @@ C 层始终以最低置信度命中，因此 `Inspect` 一定返回一个语言�
 
 ```go
 type Symbol struct {
-    Name       string     // 展示名，例如 main.Add、rust_hello::add
-    Mangled    string     // 原始名，例如 _RNvCs4FrXkKnA8Dq_10rust_hello3add
+    Name       string     // 展示名，例如 main.Add、main.(*Box[int]).Get、rust_hello::add
+    Mangled    string     // 原始名，例如 _RNv...、main.(*Box[go.shape.int]).Get
     Address    uint64
     Size       uint64
     Kind       SymbolKind
@@ -82,12 +82,55 @@ type Symbol struct {
     Library    string
     Source     string     // pclntab、rust-demangle；空表示容器符号表
     Convention Convention // 空表示语言约定；platform 表示保留平台约定
+    Identity   *Identity  // 语言层拆分：包、接收者、类型实参、闭包、family
 }
 ```
 
 - `Image.SymbolByName` 同时匹配 `Name` 与 `Mangled`，所以 `--func` 可用任一形式。
+- `Identity` 是语言中立的只读拆分。Go 泛型实例的 `Name` 是 `main.(*Box[int]).Get`，`Mangled` 是 `main.(*Box[go.shape.int]).Get`；两者都选中同一个函数体。
 - Rust 的 demangle 会省略 crate hash。展示名冲突时写成 `name@0xADDRESS`，不会把两个单态化合并成一个 SSA 函数。
 - `Convention` 让 `asm2lowir` 不必认识具体语言：它只检查语言是否提供覆盖，以及该函数是否被标记为 `platform`。
+
+### Go 名称拆分
+
+`loader/language/golang.ParseInstance` 把 pclntab 名称拆成 `Name`、`Raw`、`Package`、`Receiver`、`Function`、`Closure`、`Family`、`TypeArgs`、`Generic` 与 `Synthetic`。规则与 `debug/gosym` 一致：先掩码方括号内容，再按最后一个 `/` 之后的首个 `.` 找包路径，按两个不同 `.` 找接收者。
+
+`Name` 是展示名。它去掉编译器写在实参里的 `go.shape.` 前缀，`Raw` 保留函数表中的原文：
+
+```text
+Raw   main.(*Box[go.shape.int]).Get
+Name  main.(*Box[int]).Get
+```
+
+`TypeArgs` 与 `Receiver` 同样使用展示形式。`RawTypeArgs` 保留每个实参的编译器原文（含 `go.shape.`），供审计统计哈希形状。只有 64 位十六进制哈希、没有类型名的形状显示为 `shape#<前 8 位>`，避免把整段哈希写进每个符号名。
+
+`Family` 是分组键，不是展示名：把深度零的方括号组替换为 `[T]`，同一泛型函数的实例共享它。
+
+```text
+pkg.F[go.shape.int]                              -> pkg.F[T]
+pkg.(*OrderedMap[go.shape.string,go.shape.int64]).Add -> pkg.(*OrderedMap[T]).Add
+pkg.F[go.shape.int].func1                        -> pkg.F[T].func1
+```
+
+`type:` 与 `go:` 前缀是编译器保留名，方括号属于类型语法，不做拆分；`-fm` 方法值包装也标记为 `Synthetic`。这些名字的 `Name` 与 `Raw` 相同。`ShapeName` 去掉 `go.shape.` 前缀；`IsShapeHash` 识别 64 位十六进制哈希形状。
+
+`Golang.Recover` 把拆分结果写进 `Symbol`：`Name` 用展示名，原文不同时写 `Mangled`，并附加 `Identity`。`lift --func` 因此可直接写 `main.(*Box[int]).Get`，也可写 pclntab 原文。伪源码的函数头使用展示名；`ssa2source` 的参数裁剪按最后一对平衡括号定位参数表，保留 `main.(*Box[int]).Get` 这类带括号的函数名。
+
+### Go text 基址
+
+Go 1.18 起的函数表把每个入口写成相对 `runtime.text` 的偏移。Go 1.22 的表头还记录 `textStart`；此字段在较新的链接器中为零。外部链接可以把 C 启动代码放在 Go 代码前方。此时用 `.text` 节首地址作基址会算错函数地址。
+
+`textStart` 按以下顺序取基址：
+
+1. `runtime.text` 符号。
+2. `runtime.moduledata`：读取 `.go.module` 节，找不到时按 8 字节对齐扫描 `.noptrdata`、`.data`、`.data.rel.ro`、`.rdata`，寻找 `pcHeader` 指针。
+3. 函数表头的 `textStart`，只接受已映射到可执行区域的非零地址。
+4. `.text` 节地址。
+5. 第一个可执行区域地址。
+
+模块数据必须通过完整校验才算命中：`pcHeader`、`funcnametab`、`cutab`、`filetab`、`pctab`、`pclntable`、`ftab` 指针都与函数表头一致，且 `ftab` 长度等于函数数加一。`text <= minpc < maxpc <= etext` 也必须成立。`maxpc` 是最后一个函数结束后的地址，可以等于 `etext`。字段偏移只覆盖 Go 1.18 起稳定的前半部分；类型与 itab 区间在后续版本里位置变化，不读取。
+
+`.gopclntab` 的体积上限按名称区分：命名的 Go 表允许 512 MiB，`.rdata`、`.data.rel.ro` 这类回退节仍为 64 MiB。yaklang 二进制自身的函数表约 85 MiB，旧上限会让剥离后的镜像完全无法恢复名称。
 
 ## ABI：平台默认与语言覆盖
 
@@ -265,6 +308,8 @@ REIFY_TEST_OUTPUT_DIR="$RUN/tests" scripts/ssa-test.sh -count=1 -timeout=10m ./c
 | 用例 | 断言 |
 | --- | --- |
 | `TestGoBinariesIdentifyRecoverAndLift` | linux/amd64 未剥离与剥离、windows/amd64、darwin/arm64；识别、pclntab 恢复、lift、函数级 ABI |
+| `TestGoGenericInstanceNamesDriveLift` | 泛型方法、泛型函数、泛型闭包：未剥离与剥离产物中，展示名与 pclntab 原文都选中同一函数体，伪源码使用展示名 |
+| `TestMergeKeepsGoIdentity` | 容器符号合并 pclntab 名称时保留 Identity，容器精确大小优先 |
 | `TestRustBinaryIdentifyDemangleAndLift` | v0 demangle、展示名与编码名都能选函数、直接调用目标可读 |
 | `TestDemangleV0AndLegacy` | v0、legacy、Mach-O 前导下划线、`.llvm` 后缀 |
 | `TestV0RealForms` | 空标识符、嵌套闭包与消歧数、`K` 命名空间、闭包作泛型实参 |
@@ -285,5 +330,17 @@ REIFY_TEST_OUTPUT_DIR="$RUN/tests" scripts/ssa-test.sh -count=1 -timeout=10m ./c
 | `TestLanguageNamesAndFunctionFactsRoundTrip` | 含逗号/箭头/空格的 Rust 名与函数级 ABI 的文本往返 |
 | `TestLanguageFactsArePerFunction` | 语言 ABI 不落到 cgo、平台约定或未标记地址 |
 | `TestVersionAndABI` / `TestFuncSizeTrimsOnlyAlignmentFill` / `TestPclntabRejectsUnboundedCount` | Go 版本、ABI、填充剥离与坏表拒绝 |
+| `TestParseInstanceSplitsGenericNames` | 泛型函数、泛型方法、闭包、切片/数组/结构体实参、保留名；Name/Raw/Receiver/TypeArgs 展示形式 |
+| `TestParseInstanceRendersHashedShape` | 无类型名的哈希形状显示为 `shape#<8 位>` |
+| `TestInstanceKeepsRawTypeArgs` | `RawTypeArgs` 保留 `go.shape.` 原文，展示实参同时可得 |
+| `TestParseInstanceKeepsFamilyStable` | 族键幂等；同族实例共享键；不同方法不共享 |
+| `TestInstanceIdentity` | `Symbol.Identity` 的包、接收者、类型实参、闭包与 family |
+| `TestPruneUnusedParametersKeepsParenthesizedName` | 带括号的 Go 方法名不被参数裁剪截断 |
+| `FuzzParseInstance` | 任意名称不 panic，族键重解析不变 |
+| `TestRecoverModuleDataFromNamedSection` | `.go.module` 中的模块数据通过全部指针与计数校验 |
+| `TestRecoverModuleDataScansDataSection` | 无命名节时从 `.noptrdata` 扫描 |
+| `TestRecoverModuleDataRejectsMismatch` | 指针、计数或 text 区间不符时拒绝 |
+| `TestTextStartPrefersRuntimeTextSymbol` / `TestTextStartUsesModuleDataWhenStripped` / `TestTextStartFallsBackToTextSection` | 基址来源优先级 |
+| `TestMetadataLimitAllowsLargeNamedPclntab` | 命名表允许 85 MiB 以上，回退节仍是 64 MiB |
 
 `FuzzPCLNTab` 对 pclntab 头部做模糊测试，要求不 panic。

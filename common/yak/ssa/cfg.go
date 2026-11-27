@@ -633,6 +633,11 @@ type SwitchBuilder struct {
 
 	buildDefault func()
 
+	// AutoBreak is the language policy for case fallthrough. It decides both
+	// the CFG edge out of a case body (done vs next case) and the scope merge
+	// topology (switch-end merge vs chain into the next case). C and C++ keep
+	// false because an arm falls through unless it breaks; Java-style
+	// languages set true. It does not change how one arm's end scope is built.
 	AutoBreak bool
 }
 

@@ -18,6 +18,7 @@ const (
 	HTTPAcceptLang
 	HTTPAcceptEnc
 	HTTPReferer
+	HTTPRequestHeader
 
 	// http resp
 	HTTPStatMsg
@@ -26,6 +27,7 @@ const (
 	HTTPResponseBody
 	HTTPServer
 	HTTPLocation
+	HTTPResponseHeader
 
 	// http common
 	HTTPHeader
@@ -78,6 +80,13 @@ const (
 
 	// SSH
 	SSHProto
+	SSHSoftware
+
+	// File inspection
+	FileMagic
+
+	// DCE/RPC
+	DCERPCStubData
 )
 
 var HTTP_REQ_ONLY = []Modifier{
@@ -93,6 +102,7 @@ var HTTP_REQ_ONLY = []Modifier{
 	HTTPAcceptLang,
 	HTTPAcceptEnc,
 	HTTPReferer,
+	HTTPRequestHeader,
 }
 
 var HTTP_RESP_ONLY = []Modifier{
@@ -102,6 +112,7 @@ var HTTP_RESP_ONLY = []Modifier{
 	HTTPResponseBody,
 	HTTPServer,
 	HTTPLocation,
+	HTTPResponseHeader,
 }
 
 func IsHTTPModifier(mdf Modifier) bool {

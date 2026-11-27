@@ -17,6 +17,7 @@ import (
 	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/utils/omap"
+	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
 
 type ReActLoopCoreGenerateCode func(
@@ -110,13 +111,19 @@ type ReActLoop struct {
 	aiTagFields  *omap.OrderedMap[string, *LoopAITagField]
 
 	// execution state
-	taskMutex   *sync.Mutex
-	currentTask aicommon.AIStatefulTask
+	taskMutex         *sync.Mutex
+	currentTask       aicommon.AIStatefulTask
+	attachedResources []aicommon.AttachedResourceData
 	// promptMode is the prompt mode of the current iteration. It is set when the
 	// prompt is built and stays until the next prompt replaces it.
-	promptMode aicommon.LoopPromptMode
-	requestTimelineThroughID    *int64
-	requestTimelineItemIDs      []int64
+	promptMode               aicommon.LoopPromptMode
+	requestTimelineThroughID *int64
+	requestTimelineItemIDs   []int64
+	imagePrompt              *imagePromptSnapshot
+	imageRejectedModel       string
+	// Pinned when the iteration captures its prompt inputs; shared by prompt
+	// rebuilds and quality requests, never by auxiliary or vision routing.
+	requestModelConfig *ypb.AIModelConfig
 	// lastFittingTimelineThroughID is the boundary of the latest prompt the
 	// provider accepted. Overflow compression rebuilds only through this ID.
 	lastFittingTimelineThroughID *int64
@@ -563,6 +570,23 @@ func (r *ReActLoop) GetConfig() aicommon.AICallerConfigIf {
 	return r.config
 }
 
+// GetAttachedResources returns the parsed resources prepared for the current
+// task. Parsing and binding happen once in ExecuteWithExistedTask before any
+// loop-specific init handler runs.
+func (r *ReActLoop) GetAttachedResources() []aicommon.AttachedResourceData {
+	if r == nil {
+		return nil
+	}
+	return r.attachedResources
+}
+
+func (r *ReActLoop) prepareTaskAttachedResources(task aicommon.AIStatefulTask) {
+	if r == nil || task == nil {
+		return
+	}
+	r.attachedResources = RunAttachedExtraResourcesInit(r.invoker, r, task.GetAttachedDatas())
+}
+
 // GetSubAgentProgressRegistry returns the sub-agent progress registry.
 // nil if no sub-agents have been dispatched.
 func (r *ReActLoop) GetSubAgentProgressRegistry() *ProgressRegistry {
@@ -720,7 +744,13 @@ func NewReActLoop(name string, invoker aicommon.AIInvokeRuntime, options ...ReAc
 		loopAction_SaveEvidence,
 		loopAction_CompressContext,
 		loopAction_ManageAsyncExecutionRuntime,
+		loopAction_InspectImage,
+		loopAction_AnalyzeImage,
+		loopAction_ListImages,
 	} {
+		if (action == loopAction_InspectImage || action == loopAction_AnalyzeImage || action == loopAction_ListImages) && aicommon.ImageConfigFrom(config) == nil {
+			continue
+		}
 		r.actions.Set(action.ActionType, withNativeActionDescription(action))
 	}
 

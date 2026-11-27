@@ -1,0 +1,141 @@
+package preprocess
+
+type macroCollector struct {
+	project   *CPreprocessProject
+	tables    MacroTables
+	depth     int
+	seenFiles map[string]bool
+	// skipVariantIncludes stops the walk at other-platform headers. The shared
+	// project macro table is built with it so a Windows/COM header that a
+	// project header includes cannot redefine identifiers for every unit. A
+	// translation unit's own include chain still follows them, because that is
+	// where C makes them visible.
+	skipVariantIncludes bool
+}
+
+// buildMacroTables collects macros from all project headers and the entry translation unit.
+// Macro expansion is include-agnostic: headers do not need to be #included to contribute macros.
+// Header contribution is cached on the project; only the TU is rescanned per call.
+func (p *CPreprocessProject) buildMacroTables(entryPath, src string) MacroTables {
+	// Merge the cached header table into an empty table instead of cloning it:
+	// Clone converts the whole table three times, and the result is mutated
+	// right below, so the extra copies buy nothing.
+	out := NewMacroTables()
+	out.MergeFrom(p.getHeaderMacroTables())
+	out.MergeFrom(p.collectMacrosFromSource(entryPath, src))
+	return out
+}
+
+// collectMacroEnvironment is kept for manual/integration checks.
+func (p *CPreprocessProject) collectMacroEnvironment(entryPath, src string) MacroTables {
+	return p.buildMacroTables(entryPath, src)
+}
+
+func (p *CPreprocessProject) collectMacrosFromSource(filePath, src string) MacroTables {
+	return p.collectMacrosFromSourceOpts(filePath, src, false)
+}
+
+// collectProjectMacrosFromSource is the shared-table pass: project headers only,
+// and no other-platform includes.
+func (p *CPreprocessProject) collectProjectMacrosFromSource(filePath, src string) MacroTables {
+	return p.collectMacrosFromSourceOpts(filePath, src, true)
+}
+
+func (p *CPreprocessProject) collectMacrosFromSourceOpts(filePath, src string, skipVariantIncludes bool) MacroTables {
+	mc := &macroCollector{
+		project:             p,
+		tables:              NewMacroTables(),
+		seenFiles:           make(map[string]bool),
+		skipVariantIncludes: skipVariantIncludes,
+	}
+	mc.scanSource(filePath, src, p.config.Defines)
+	return mc.tables
+}
+
+func (mc *macroCollector) scanSource(filePath, src string, defs map[string]string) {
+	if mc.depth >= mc.project.config.MaxIncludeDepth {
+		return
+	}
+	norm := normalizeSlash(filePath)
+	if mc.seenFiles[norm] {
+		return
+	}
+	mc.seenFiles[norm] = true
+	mc.depth++
+
+	// Flat local tables for this file — no nested MacroEnvironment Flatten/Clone.
+	// Nested #include is followed for macro collection (project + external roots).
+	local := NewMacroTables()
+	localEnv := &MacroEnvironment{tables: local}
+	cond := NewConditionalStackWithGlobal(localEnv, nil, defs)
+
+	for _, line := range JoinLogicalLines(src) {
+		if handleCondDirective(cond, line) {
+			continue
+		}
+		if !cond.Active() {
+			continue
+		}
+		if incPath, system, ok := ParseIncludePath(line); ok {
+			mc.ingestHeader(filePath, incPath, system, defs)
+			continue
+		}
+		switch DirectiveName(line) {
+		case "define":
+			ApplyDefineLine(line, &local, false)
+		case "undef":
+			macro := ppFirstIdent(DirectiveRest(line))
+			if macro != "" {
+				delete(local.Function, macro)
+				delete(local.Object, macro)
+			}
+		}
+	}
+
+	mc.tables.MergeFrom(local)
+	mc.depth--
+}
+
+func (mc *macroCollector) ingestHeader(fromPath, incPath string, system bool, defs map[string]string) {
+	if mc.project == nil || mc.project.resolver == nil {
+		return
+	}
+	h, ok := mc.project.resolver.ResolveHeader(incPath, system, fromPath)
+	if !ok {
+		return
+	}
+	if mc.skipVariantIncludes && isPlatformVariantHeader(h.Path) {
+		return
+	}
+	mc.scanSource(h.Path, string(h.Content), defs)
+}
+
+func handleCondDirective(cond *ConditionalStack, line string) bool {
+	name := DirectiveName(line)
+	switch name {
+	case "if", "ifdef", "ifndef", "elif", "else", "endif":
+		cond.HandleDirective(line)
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *CPreprocessProject) PreprocessTU(entryPath, src string) (string, error) {
+	baseTables := p.buildMacroTables(entryPath, src)
+
+	tu := &tuProcessor{
+		project:   p,
+		entryPath: normalizeSlash(entryPath),
+		base:      baseTables,
+		defs:      p.config.Defines,
+	}
+	return tu.run(src), nil
+}
+
+type tuProcessor struct {
+	project   *CPreprocessProject
+	entryPath string
+	base      MacroTables
+	defs      map[string]string
+}

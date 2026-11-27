@@ -12,6 +12,45 @@ import (
 	"golang.org/x/exp/slices"
 )
 
+// VariadicArgsBinding names the call binding that carries the complete
+// positional vector for the final variadic formal parameter.
+//
+// Most frontends pass one Arg per formal slot and bind a variadic member like
+// fn(a, ...rest)[0] directly to Args[objectIndex+offset]. A shell call has no
+// fixed arity: the callee owns one vector ($@) and $1, $#, $* are members of
+// it. A shell frontend therefore sets this binding to the vector it already
+// built, so member reads and top-def resolution share one value instead of
+// reconstructing the vector from the flat Args list.
+//
+// Args still holds the source arguments, not a synthetic leading container.
+// Leaving the binding unset keeps the ordinary Args ABI for every frontend.
+const VariadicArgsBinding = "@variadic.args"
+
+// VariadicDefaultBinding names the call binding used when the positional vector
+// has no member for a requested key. Shells expand an omitted position to the
+// empty string; without this binding the member would stay undefined.
+const VariadicDefaultBinding = "@variadic.default"
+
+// PackedVariadic returns the explicit positional vector attached to the call.
+// It only applies to the final formal parameter of a variadic function. Calls
+// without the binding keep the ordinary Args ABI, and a non-variadic call or a
+// non-final formal index never reaches the packed vector.
+func (c *Call) PackedVariadic(formalIndex int) (Value, bool) {
+	id := c.Binding[VariadicArgsBinding]
+	if id == 0 {
+		return nil, false
+	}
+	method, ok := c.GetValueById(c.Method)
+	if !ok {
+		return nil, false
+	}
+	typ, ok := ToFunctionType(method.GetType())
+	if !ok || !typ.IsVariadic || formalIndex != len(typ.Parameter)-1 {
+		return nil, false
+	}
+	return c.GetValueById(id)
+}
+
 func NewCall(target Value, args Values, binding map[string]Value, block *BasicBlock) *Call {
 	bind := make(map[string]int64, len(binding))
 	for name, value := range binding {
@@ -449,6 +488,25 @@ func (c *Call) handleCalleeFunction() {
 				}
 			}
 
+			if p.MemberCallKind == ParameterMemberCall {
+				if vec, ok := c.PackedVariadic(p.MemberCallObjectIndex); ok {
+					var member Value
+					if _, concrete := ToMake(vec); concrete {
+						member, _ = vec.GetStringMember(actualKey.String())
+						if member == nil {
+							member, _ = c.GetValueById(c.Binding[VariadicDefaultBinding])
+						}
+					}
+					if member == nil {
+						member = builder.ReadMemberCallValue(vec, actualKey)
+					}
+					if !utils.IsNil(member) {
+						member.AddUser(c)
+						c.ArgMember = append(c.ArgMember, member.GetId())
+						continue
+					}
+				}
+			}
 			object, ok := p.GetActualParam(c)
 			if !ok {
 				continue
@@ -585,6 +643,12 @@ func (c *Call) HandleFreeValue(fvs []*Parameter) {
 	}
 
 	for _, fv := range fvs {
+		// The frontend may already have resolved a dynamically scoped input
+		// at the call site. Do not replace an explicit binding with the
+		// lexical declaration's default.
+		if c.Binding[fv.GetName()] != 0 {
+			continue
+		}
 		handleError := func() {
 			// mark error in freeValue.Variable
 			// get freeValue

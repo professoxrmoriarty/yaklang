@@ -1,0 +1,26 @@
+{
+  "name": "memory",
+  "note": "内存读写是带真实操作数的指令：写没有结果，读的结果是一条独立语句",
+  "ssair": [
+    "write_after_read <i64> (1) arg0",
+    "type: (i64) -> i32",
+    "entry_0:",
+    "    <ptr64> t2 = type_cast[ptr64] <i64> arg0",
+    "    <i32> t3   = load <ptr64> t2",
+    "    <i32> t4   = <ptr64> t2 store <i32> 7",
+    "    ret <i32> t3"
+  ],
+  "source": [
+    "uint32_t write_after_read(uint64_t arg0) {",
+    "    v3 = *(uint32_t *)((void *)arg0);",
+    "    *(uint32_t *)((void *)arg0) = 0x7;",
+    "    return v3;",
+    "}"
+  ],
+  "forbidden": [
+    "load(",
+    "store(",
+    "load:",
+    "store:"
+  ]
+}

@@ -72,6 +72,11 @@ type ProtocolEvent struct {
 	doipAssociationRefusal             bool // private complete-frame refusal scope
 	nativeCANRecord                    bool
 	ocpp                               bool
+	applicationMessagePacketRefs       []PacketReference
+	applicationObjectDirection         string
+	applicationObjectURI               string
+	applicationObjectAuthority         string
+	applicationObjectMethod            string
 	Domain                             CaptureDomain
 	SourceBytes                        ByteSource
 	// CarrierLayers lists observed protocol envelopes between the physical
@@ -106,6 +111,36 @@ type ProtocolEvent struct {
 	historySequence uint64
 	ipp             bool
 	sessionError    *ProtocolError
+	// Only a request-local detail view can have a bounded Raw prefix.
+	// Its storage length checks saved coordinates; never use it to slice Raw.
+	storedWireLength int
+}
+
+// ApplicationMessagePacketRefs returns the physical contributors to a complete
+// application message whose bytes may span several protocol frames.
+func (e *ProtocolEvent) ApplicationMessagePacketRefs() []PacketReference {
+	if e == nil {
+		return nil
+	}
+	return append([]PacketReference(nil), e.applicationMessagePacketRefs...)
+}
+
+// ApplicationObjectDirection reports the observed application transfer
+// direction when a complete object is available. Empty means not established.
+func (e *ProtocolEvent) ApplicationObjectDirection() string {
+	if e == nil {
+		return ""
+	}
+	return e.applicationObjectDirection
+}
+
+// ApplicationObjectContext reports retained request context for a complete
+// application object when the carrying protocol provides it.
+func (e *ProtocolEvent) ApplicationObjectContext() (uri, authority, method string) {
+	if e == nil {
+		return "", "", ""
+	}
+	return e.applicationObjectURI, e.applicationObjectAuthority, e.applicationObjectMethod
 }
 
 // BinParserEvent is retained for source compatibility. Use ProtocolEvent.
@@ -611,6 +646,16 @@ type BinParserBinding struct {
 type BinParserConfig struct {
 	TFTPFilePort       uint16
 	TFTPFileBytesLimit int
+	// HTTPResponseWithoutRequest enables response framing from the response
+	// itself when an offline capture starts in the middle of a TCP stream.
+	// Such events remain explicitly marked as lacking request context.
+	HTTPResponseWithoutRequest bool
+	// DisableTCPProbeResync opts out of retrying protocol admission at later
+	// observed TCP delivery boundaries. The default never scans inside an
+	// accepted protocol message or a UDP datagram.
+	DisableTCPProbeResync bool
+	TFTPFileAuto          bool
+	FTPFileBytesLimit     int
 	// DecodeDNP3ReadPoints opts into bounded class READ/static point observations.
 	DecodeDNP3ReadPoints bool
 	// DecodeDNP3TransportFragments enables bounded TCP DNP3 transport assembly.
@@ -725,6 +770,8 @@ type binParser struct {
 	ftpMu                                                                      sync.Mutex
 	ftpClock                                                                   time.Time
 	ftpEndpoints                                                               map[ftpDataKey]ftpDataBinding
+	ftpFiles                                                                   map[uint64]*ftpFileTransfer
+	ftpFileBytes                                                               int64
 	pfcpSessionIdentity                                                        *pfcpSessionIdentity
 	semtechDisabled                                                            bool                                       // udpMu; bounded opt-in correlation fails closed after global state exhaustion
 	semtechSessions                                                            *binUDPStore                               // udpMu; token quarantine must survive unrelated UDP expiry
@@ -841,7 +888,13 @@ func (c *CaptureConfig) prepareBinParser() error {
 	if config.TFTPFilePort != 0 && c.datagramDecodeAs[config.TFTPFilePort] != "" {
 		return fmt.Errorf("TFTP file service conflicts with explicit DecodeAs")
 	}
-	if config.TFTPFileBytesLimit < 0 || config.TFTPFileBytesLimit > tftpMaximumFileBytes || (config.TFTPFilePort == 0) != (config.TFTPFileBytesLimit == 0) {
+	if config.FTPFileBytesLimit < 0 || config.FTPFileBytesLimit > MaxFTPFileBytes {
+		return fmt.Errorf("invalid FTP file assembly configuration")
+	}
+	if config.TFTPFileBytesLimit < 0 || config.TFTPFileBytesLimit > tftpMaximumFileBytes ||
+		config.TFTPFileBytesLimit == 0 && (config.TFTPFilePort != 0 || config.TFTPFileAuto) ||
+		config.TFTPFileBytesLimit > 0 && !config.TFTPFileAuto && config.TFTPFilePort == 0 ||
+		config.TFTPFileAuto && config.TFTPFilePort != 0 {
 		return fmt.Errorf("invalid TFTP file assembly configuration")
 	}
 	if config.MaxMessageBytes < 64 || config.MaxMessageBytes > 64<<20 || config.MaxBufferedBytes < config.MaxMessageBytes || config.ProbeBytes < 16 || config.ProbeBytes > config.MaxMessageBytes {
@@ -998,6 +1051,7 @@ type binDirection struct {
 	tlsPlaintextGap        bool
 	tlsGapHTTPPending      bool
 	contributions          []contribution
+	probeArrivals          []probeArrival
 	evidenceLimited        bool
 	headerScan             int
 	http                   *binHTTPState
@@ -1311,6 +1365,7 @@ func (f *binFlow) release(d *binDirection) {
 	d.tlsGapHTTPPending = false
 	f.a.buffered.Add(-int64(cap(d.buffer)) - int64(len(d.contributions))*80)
 	d.contributions = nil
+	d.probeArrivals = nil
 	d.buffer = nil
 	d.headerScan = 0
 }
@@ -1623,6 +1678,9 @@ func (f *binFlow) feed(dir int, data []byte, ts time.Time) {
 			a.probes.Add(1)
 			f.detectDirection(dir, wire)
 			detected = f.protocol != ""
+			if detected {
+				f.clearTCPProbeArrivals()
+			}
 			if detected && f.protocol == "gopher" && f.textInternet != nil && dir != f.textInternet.clientDir {
 				// Gopher replies carry no request identifier. Apply any buffered
 				// selector first so the response event can include its observed context.
@@ -1632,6 +1690,12 @@ func (f *binFlow) feed(dir int, data []byte, ts time.Time) {
 				}
 			}
 			if f.protocol == "" {
+				if n, ts, ok := f.probeLatestTCPArrival(dir, wire); ok {
+					detected = true
+					f.skipRejectedTCPProbePrefix(dir, n, ts)
+					wire = wire[n:]
+					continue
+				}
 				if len(wire) >= a.config.ProbeBytes {
 					if len(wire) < 4+smb2HeaderSize && probeSMB2(wire, a.budget.MaxFrameBytes).Verdict == ProbeNeedMore {
 						break
@@ -1653,6 +1717,11 @@ func (f *binFlow) feed(dir int, data []byte, ts time.Time) {
 					}
 					if len(wire) < a.budget.MaxFrameBytes && (needsMoreNBSSPrefix(wire, a.budget.MaxFrameBytes) || needsMoreTelnetPrefix(wire) || probeSLMPTCP(wire, min(a.budget.MaxFrameBytes, a.config.MaxMessageBytes), false).Verdict == ProbeNeedMore || wrapperIncompletePrefix(wire, a.budget.MaxFrameBytes) || f.captureTCP && probeDNSTCP(wire, a.budget.MaxFrameBytes).Verdict == ProbeNeedMore || needsMoreS7Prefix(wire, a.budget.MaxFrameBytes) || probeWCF(wire, min(a.budget.MaxFrameBytes, a.config.MaxMessageBytes)).Verdict == ProbeNeedMore || f.needsMoreSSHServerPreamble(dir, wire) || initialProtocolNeedMore(wire, a.budget.MaxFrameBytes).Verdict == ProbeNeedMore || needsMoreHTTPStartLine(wire) || f.needsMorePortProtocolPrefix(wire) || f.needsMoreBoundedText(wire) || f.needsMoreOpenWire(wire) || !f.captureTCP && probeRADIUSAccountingByte(wire, min(a.budget.MaxFrameBytes, a.config.MaxMessageBytes)).Verdict == ProbeNeedMore) {
 						break
+					}
+					if n, ts, ok := f.nextTCPProbeArrival(dir, wire); ok {
+						f.skipRejectedTCPProbePrefix(dir, n, ts)
+						wire = wire[n:]
+						continue
 					}
 					f.stop(dir, wire, "unrecognized", "TCP application protocol not recognized")
 					return

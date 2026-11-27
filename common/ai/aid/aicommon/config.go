@@ -31,6 +31,7 @@ import (
 	fi "github.com/yaklang/yaklang/common/utils/filesys/filesys_interface"
 	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
+	"google.golang.org/protobuf/proto"
 )
 
 // DefaultPeriodicVerificationInterval 是 verification iter 门的基础节拍.
@@ -49,7 +50,7 @@ const DefaultMaxSubAgentConcurrency = 5
 const AbsoluteMaxSubAgentConcurrency = 20
 
 // DefaultTimelineContentSizeLimit 是运行时上下文的服务端默认压缩阈值，单位是 token。
-// RuntimeContextSizeLimit <= 0 时使用该值，避免零值把带有 Skill、Evidence 的时间线提前压小。
+// 保留 SDK 与辅助循环的原始默认值；质量模型的可编辑默认值独立为 500,000。
 const DefaultTimelineContentSizeLimit = 300 * 1024
 
 type ConfigOption func(*Config) error
@@ -175,6 +176,7 @@ type Config struct {
 	SessionSource      string
 	SessionTitle       string
 	SessionPromptState *SessionPromptState
+	ImageInput         *ypb.AIImageInputConfig
 
 	// memory triage id
 	MemoryTriageId string
@@ -212,9 +214,12 @@ type Config struct {
 	AICallbacks *AICallbacks
 
 	// Optional per-runtime helper implementation; the default uses the registered LiteForge.
-	LiteForgeExecutor   LiteForgeExecuteCallback
-	promptOverflowJudge promptOverflowJudgeState
-	promptOverflowLimit promptOverflowLimitState
+	LiteForgeExecutor           LiteForgeExecuteCallback
+	promptOverflowJudge         promptOverflowJudgeState
+	promptOverflowLimit         promptOverflowLimitState
+	modelContextState           modelContextState
+	modelContextSettingsEnabled bool
+	primaryModelContextConfig   *ypb.AIModelConfig
 	// promptOverflowRetryMax bounds compress-and-retry rounds per iteration
 	// after a confirmed prompt overflow. 0 disables the retry.
 	promptOverflowRetryMax int
@@ -266,8 +271,9 @@ type Config struct {
 	inheritedToolManager         bool
 
 	// browserSessionTracker records browser ids opened by yak tools for session cleanup.
-	browserSessionTracker           BrowserSessionTracker
-	browserHTTPFlowIdentityResolver BrowserHTTPFlowIdentityResolver
+	browserSessionTracker              BrowserSessionTracker
+	browserHTTPFlowIdentityResolver    BrowserHTTPFlowIdentityResolver
+	browserAttachmentReferenceResolver BrowserAttachmentReferenceResolver
 
 	// tool config
 	DisableToolUse               bool
@@ -380,15 +386,21 @@ type Config struct {
 	verificationWatchdogToolBlockingEnd   func()
 
 	// iteration limit
-	MaxIterationCount        int64
-	EnableGoalMode           bool
-	GoalMinIterations        int64
-	GoalDurationSeconds      int64     // Goal mode time window in seconds; -1 = never auto-finish, 0 = disabled
-	GoalAcceptanceCriteria   string    // Goal mode acceptance criteria; non-empty enables one main-model review turn
-	GoalDeadline             time.Time // Computed deadline for goal time window (zero = not started)
+	MaxIterationCount      int64
+	EnableGoalMode         bool
+	GoalMinIterations      int64
+	GoalDurationSeconds    int64  // Declared goal window length in seconds; -1 = never auto-finish, 0 = disabled
+	GoalAcceptanceCriteria string // Goal mode acceptance criteria; non-empty enables one main-model review turn
+	// GoalDeadline is the runtime state of the current task's goal window:
+	// zero means the time gate is closed, the far-future sentinel from
+	// computeGoalDeadline(-1) means never ending, anything else is a finite
+	// deadline. GoalTimePatch may read GoalDurationSeconds but only ever writes
+	// this field, so a runtime command can never rewrite declared config.
+	GoalDeadline             time.Time
 	goalTimeRevision         uint64
 	agentPolicyRevision      uint64
 	agentPolicyEmitHandler   func()
+	agentPolicyHotpatchMu    sync.Mutex
 	DisableIncreaseIteration bool
 
 	// task config
@@ -999,12 +1011,22 @@ func WithAICallbacks(callbacks *AICallbacks) ConfigOption {
 	}
 }
 
+// WithInheritTieredAICallback captures callbacks and their quality-context binding
+// when the options are prepared, including for children waiting in a queue.
+// A nil explicit model stays nil so global model selection remains dynamic.
+// Pending overflow recovery is runtime-local and is deliberately not inherited.
 func WithInheritTieredAICallback(parent *Config, force bool) ConfigOption {
-	return func(c *Config) error {
-		if parent == nil {
-			return nil
+	var raw *AICallbacks
+	var contextEnabled bool
+	var model *ypb.AIModelConfig
+	if parent != nil {
+		raw = parent.GetRawAICallbacks()
+		contextEnabled = parent.modelContextSettingsEnabled
+		if parent.primaryModelContextConfig != nil {
+			model = proto.Clone(parent.primaryModelContextConfig).(*ypb.AIModelConfig)
 		}
-		raw := parent.GetRawAICallbacks()
+	}
+	return func(c *Config) error {
 		if raw == nil {
 			return nil
 		}
@@ -1016,6 +1038,11 @@ func WithInheritTieredAICallback(parent *Config, force bool) ConfigOption {
 		}
 		c.m.Lock()
 		c.setAICallbacksLocked(raw)
+		c.modelContextSettingsEnabled = contextEnabled
+		c.primaryModelContextConfig = nil
+		if model != nil {
+			c.primaryModelContextConfig = proto.Clone(model).(*ypb.AIModelConfig)
+		}
 		c.m.Unlock()
 		return nil
 	}
@@ -1115,6 +1142,7 @@ func WithTieredAICallback(singleModelMode ...bool) ConfigOption {
 			return nil
 		}
 
+		c.modelContextSettingsEnabled = true
 		serviceName, modelName, err := GetIntelligentAIModelInfo(single)
 		if err != nil {
 			log.Warnf("Failed to get service and model name from tiered config: %v", err)
@@ -1790,17 +1818,6 @@ func WithDynamicContextProvider(name string, provider ContextProvider) ConfigOpt
 func WithTracedDynamicContextProvider(name string, provider ContextProvider) ConfigOption {
 	return func(c *Config) error {
 		if name != "" {
-			c.ContextProviderManager.RegisterTracedContent(name, provider)
-		}
-		return nil
-	}
-}
-
-// WithTracedFileContext monitors a file and provides its content as context with change tracking
-func WithTracedFileContext(name string, filePath string) ConfigOption {
-	return func(c *Config) error {
-		if name != "" && filePath != "" {
-			provider := FileContextProvider(filePath)
 			c.ContextProviderManager.RegisterTracedContent(name, provider)
 		}
 		return nil
@@ -2615,13 +2632,12 @@ func WithEnableGoalMode(enable bool) ConfigOption {
 	}
 }
 
+// WithGoalMinIterations sets the iteration gate; zero explicitly disables it.
+// Config construction supplies the default when this option is not provided.
 func WithGoalMinIterations(n int64) ConfigOption {
 	return func(c *Config) error {
 		if n < 0 {
 			return utils.Error("goal min iterations must be >= 0")
-		}
-		if n == 0 {
-			n = DefaultGoalMinIterations
 		}
 		if c.m == nil {
 			c.m = &sync.Mutex{}
@@ -2634,14 +2650,24 @@ func WithGoalMinIterations(n int64) ConfigOption {
 }
 
 // WithGoalDurationSeconds sets the goal-mode time window in seconds.
-// >0: finish is unconditionally rejected until the deadline passes.
+// >0: start counting now; finish is rejected until the deadline passes.
 // -1: finish is never auto-accepted (never-ending mode).
 // 0: time window gate is disabled (default).
 func WithGoalDurationSeconds(seconds int64) ConfigOption {
 	return func(c *Config) error {
+		if err := validateGoalDurationSeconds(seconds); err != nil {
+			return err
+		}
 		c.setGoalDurationSeconds(seconds)
 		return nil
 	}
+}
+
+func validateGoalDurationSeconds(seconds int64) error {
+	if seconds < -1 || seconds > int64((1<<63-1)/time.Second) {
+		return utils.Error("goal duration must be -1, 0, or a representable positive duration")
+	}
+	return nil
 }
 
 // WithGoalAcceptanceCriteria sets the goal-mode acceptance criteria.
@@ -4151,10 +4177,13 @@ func (c *Config) EventFormat(e *schema.AiOutputEvent) *schema.AiOutputEvent {
 }
 
 func (c *Config) emitBaseHandler(e *schema.AiOutputEvent) {
-	select {
-	case <-c.Ctx.Done():
-		return
-	default:
+	// Child tree snapshots also close calls cancelled with the parent session.
+	if e.Type != schema.EVENT_TYPE_SUB_FORGE_TASK_TREE {
+		select {
+		case <-c.Ctx.Done():
+			return
+		default:
+		}
 	}
 
 	e = c.EventFormat(e)
@@ -4166,6 +4195,23 @@ func (c *Config) emitBaseHandler(e *schema.AiOutputEvent) {
 		}
 	}
 
+	// A cancelled caller must observe its durable terminal snapshot before
+	// returning, even if a subscriber is blocked. Only delivery is detached.
+	if e.Type == schema.EVENT_TYPE_SUB_FORGE_TASK_TREE && !e.IsSync && e.GetContentJSONPath("$.status") != "running" {
+		go func() {
+			defer func() {
+				if failure := recover(); failure != nil {
+					log.Errorf("sub-Forge terminal handler panicked: %v", failure)
+				}
+			}()
+			c.deliverEvent(e)
+		}()
+		return
+	}
+	c.deliverEvent(e)
+}
+
+func (c *Config) deliverEvent(e *schema.AiOutputEvent) {
 	if c.Guardian != nil {
 		c.Guardian.Feed(e)
 	}
@@ -4364,6 +4410,9 @@ func convertConfigToOptions(i *Config, inheritHotPatch bool) []ConfigOption {
 	if i.browserHTTPFlowIdentityResolver != nil {
 		opts = append(opts, WithBrowserHTTPFlowIdentityResolver(i.browserHTTPFlowIdentityResolver))
 	}
+	if i.browserAttachmentReferenceResolver != nil {
+		opts = append(opts, WithBrowserAttachmentReferenceResolver(i.browserAttachmentReferenceResolver))
+	}
 	// Goal strategy itself is top-level only, but its no-blocking boundary must
 	// survive a handoff into a coordinator or another nested runtime.
 	opts = append(opts, func(c *Config) error {
@@ -4383,6 +4432,7 @@ func convertConfigToOptions(i *Config, inheritHotPatch bool) []ConfigOption {
 
 	// Disable tool use flag
 	opts = append(opts, WithDisableToolUse(i.DisableToolUse))
+	opts = append(opts, WithImageInput(i.GetImageInputConfig()))
 
 	// Keep the policy with the shared manager: NewConfig applies this flag
 	// to the manager, so a child default must not reopen parent MCP access.
@@ -4546,7 +4596,7 @@ func convertConfigToOptions(i *Config, inheritHotPatch bool) []ConfigOption {
 	}
 
 	if i.ContextProviderManager != nil {
-		opts = append(opts, WithContextProvider(i.ContextProviderManager.snapshotForChild()))
+		opts = append(opts, WithContextProvider(i.ContextProviderManager))
 	}
 
 	// Dynamic planning propagation

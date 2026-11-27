@@ -11,6 +11,7 @@ import (
 
 	//js2ssa "github.com/yaklang/yaklang/common/yak/JS2ssa"
 	"github.com/yaklang/yaklang/common/yak/bash/bash2ssa"
+	cpp2ssa "github.com/yaklang/yaklang/common/yak/cpp/cpp2ssa"
 	"github.com/yaklang/yaklang/common/yak/csharp/csharp2ssa"
 	"github.com/yaklang/yaklang/common/yak/go2ssa"
 	"github.com/yaklang/yaklang/common/yak/java/java2ssa"
@@ -25,11 +26,11 @@ import (
 
 var LanguageBuilderCreater = map[ssaconfig.Language]ssa.CreateBuilder{
 	ssaconfig.Yak:    yak2ssa.CreateBuilder,
-	ssaconfig.JS:     ts2ssa.CreateBuilder,
 	ssaconfig.PHP:    php2ssa.CreateBuilder,
 	ssaconfig.JAVA:   java2ssa.CreateBuilder,
 	ssaconfig.GO:     go2ssa.CreateBuilder,
 	ssaconfig.C:      c2ssa.CreateBuilder,
+	ssaconfig.CPP:    cpp2ssa.CreateBuilder,
 	ssaconfig.TS:     ts2ssa.CreateBuilder,
 	ssaconfig.PYTHON: python2ssa.CreateBuilder,
 	ssaconfig.CSHARP: csharp2ssa.CreateBuilder,
@@ -38,6 +39,13 @@ var LanguageBuilderCreater = map[ssaconfig.Language]ssa.CreateBuilder{
 	ssaconfig.RUST:   rust2ssa.CreateBuilder,
 	ssaconfig.KOTLIN: kotlin2ssa.CreateBuilder,
 	ssaconfig.SCALA:  scala2ssa.CreateBuilder,
+}
+
+// BuilderCreatorFor returns the frontend factory for a language. Aliases are
+// resolved first, so js and ts both select the typescript builder.
+func BuilderCreatorFor(language ssaconfig.Language) (ssa.CreateBuilder, bool) {
+	create, ok := LanguageBuilderCreater[ssaconfig.CanonicalLanguage(language)]
+	return create, ok
 }
 
 // ArchiveCodeSourceOpener opens a code source that is itself an archive.

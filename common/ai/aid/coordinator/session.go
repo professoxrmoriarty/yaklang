@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -150,7 +151,7 @@ func fromRuntime(ctx context.Context, r aicommon.AIInvokeRuntime, task aicommon.
 	// Reapplying it here would duplicate append-only options and could carry
 	// the parent's preset plan into an unrelated Blueprint invocation.
 	opts = append(opts, aicommon.WithForceManualPlanReview(parent.ForceManualPlanReview))
-	opts = append(opts, aicommon.WithAICallbacks(parent.GetRawAICallbacks()), aicommon.WithEventHandler(func(e *schema.AiOutputEvent) {
+	opts = append(opts, aicommon.WithInheritTieredAICallback(parent, true), aicommon.WithEventHandler(func(e *schema.AiOutputEvent) {
 		e.CoordinatorId = id
 		if e.Type == schema.EVENT_TYPE_DETACHED_PLAN_REQUIRE {
 			e.CoordinatorId = parent.Id
@@ -219,12 +220,18 @@ func (s *Session) Close() {
 }
 func (s *Session) PlanningOnly() bool               { return s.planningOnly || s.detached }
 func (s *Session) ReportRequired() bool             { return s.GenerateReport }
-func (s *Session) Run() error                       { return s.run(false) }
-func (s *Session) RunPlanOnly() error               { return s.run(true) }
-func (s *Session) RunExecuteApprovedPlan() error    { return s.run(false) }
-func (s *Session) RunExecuteOnly() error            { return s.run(false) }
+func (s *Session) Run() error                       { return s.run(false, nil) }
+func (s *Session) RunPlanOnly() error               { return s.run(true, nil) }
+func (s *Session) RunExecuteApprovedPlan() error    { return s.Run() }
+func (s *Session) RunExecuteOnly() error            { return s.Run() }
 func (s *Session) SetRecoveryStartTaskID(id string) { s.startTaskID = id }
 func (s *Session) Snapshot() Snapshot               { return s.controller.Snapshot() }
+
+// RunWithAttachments gives the root loop this input's unprocessed attachments.
+// They are not session configuration and are not forwarded to worker tasks.
+func (s *Session) RunWithAttachments(attachments []*aicommon.AttachedResource) error {
+	return s.run(false, attachments)
+}
 
 // SubmitInput adapts an existing RPC plan payload to this runtime's own
 // approval and persistence. It never invokes a legacy planner or model loop.
@@ -337,7 +344,7 @@ func (s *Session) restore() error {
 	return s.controller.Restore(*progress.State)
 }
 
-func (s *Session) run(planningOnly bool) (err error) {
+func (s *Session) run(planningOnly bool, attachments []*aicommon.AttachedResource) (err error) {
 	runningSessions.Store(s.Id, s)
 	defer func() { s.Close(); s.controller.owned.Wait(); runningSessions.Delete(s.Id) }()
 	s.planningOnly = planningOnly
@@ -383,6 +390,7 @@ func (s *Session) run(planningOnly bool) (err error) {
 	}
 	task := aicommon.NewStatefulTaskBase("coordinator-"+s.Id, input, s.GetContext(), s.GetEmitter(), true)
 	task.SetUserInput(s.query)
+	task.SetAttachedDatas(slices.Clone(attachments))
 	if _, enabled := s.Config.MemoryTriage.(aimem.TimelineMemoryPersister); enabled && s.parent == nil && !s.PlanningOnly() {
 		release := task.DeferCompletion()
 		defer release()
@@ -477,7 +485,7 @@ func (s *Session) Execute(ctx context.Context, a Attempt) (result Result, retErr
 	}
 	opts = append(opts, aicommon.WithEnhanceKnowledgeManager(s.EnhanceKnowledgeManager.ForkForSubAgent()))
 	if a.Plan != nil {
-		state := s.GetSessionPromptState().ForkForSubAgent()
+		state := s.Config.ForkSessionPromptState(true)
 		opts = append(opts, aicommon.WithSessionPromptState(state), aicommon.WithFrozenBlockPartitionProducer(aicommon.NewFrozenBlockPartitionProducer(s.GetOrCreateFrozenBlockPartitionProducer().ProducePartitions()...)))
 	}
 	input := chanx.NewUnlimitedChan[*ypb.AIInputEvent](ctx, 10)
@@ -517,7 +525,7 @@ func (s *Session) Execute(ctx context.Context, a Attempt) (result Result, retErr
 	}
 	aicommon.WithStatefulTaskBaseContext(ctx)(task)
 	task.SetName(a.Task.Name)
-	opts = append(opts, aicommon.WithAllowRequireForUserInteract(false), aicommon.WithDisableToolCallerIntervalReview(true), aicommon.WithContext(ctx), aicommon.WithID(s.Id), aicommon.WithAICallbacks(s.GetRawAICallbacks()), aicommon.WithEventInputChanx(input), aicommon.WithHotPatchOptionChan(hotpatch), aicommon.WithDisableCreateDBRuntime(true), aicommon.WithEnablePlanAndExec(false), aicommon.WithEmitter(s.GetEmitter().PushEventProcesser(func(e *schema.AiOutputEvent) *schema.AiOutputEvent {
+	opts = append(opts, aicommon.WithAllowRequireForUserInteract(false), aicommon.WithDisableToolCallerIntervalReview(true), aicommon.WithContext(ctx), aicommon.WithID(s.Id), aicommon.WithInheritTieredAICallback(s.Config, true), aicommon.WithEventInputChanx(input), aicommon.WithHotPatchOptionChan(hotpatch), aicommon.WithDisableCreateDBRuntime(true), aicommon.WithEnablePlanAndExec(false), aicommon.WithEmitter(s.GetEmitter().PushEventProcesser(func(e *schema.AiOutputEvent) *schema.AiOutputEvent {
 		e.TaskUUID = task.GetUUID()
 		e.TaskId = task.GetId()
 		return e

@@ -1,9 +1,11 @@
 package config
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math/big"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 
@@ -82,6 +84,48 @@ func (c *Config) RandIpVar(varName string) string {
 	n := val.randInt()
 	return fmt.Sprintf("%d.%d.%d.%d", n>>24, n>>16&0xff, n>>8&0xff, n&0xff)
 }
+
+// VarMatcher provides direct zero-map-lookup matching against a resolved
+// Suricata address or port variable scope.
+type VarMatcher struct {
+	s *scope
+}
+
+// MatchAddr matches a pre-parsed netip.Addr without map lookup or big.Int
+// allocation on IPv4 addresses.
+func (m *VarMatcher) MatchAddr(addr netip.Addr) bool {
+	if m == nil || m.s == nil || !addr.IsValid() {
+		return false
+	}
+	addr = addr.Unmap()
+	if addr.Is4() {
+		b := addr.As4()
+		return m.s.hasNumber(binary.BigEndian.Uint32(b[:]))
+	}
+	return m.s.hasNumberBigInt(new(big.Int).SetBytes(addr.AsSlice()))
+}
+
+// MatchPort matches a TCP/UDP port integer without map lookup or allocation.
+func (m *VarMatcher) MatchPort(port int) bool {
+	if m == nil || m.s == nil || port < 0 {
+		return false
+	}
+	return m.s.hasNumber(uint32(port))
+}
+
+// LookupVar resolves varName once so hot-path AddressRule/PortRule matching
+// avoids repeated string map hashing.
+func (c *Config) LookupVar(varName string) *VarMatcher {
+	if c == nil || c.Vars == nil || varName == "" {
+		return nil
+	}
+	val, ok := c.Vars[varName]
+	if !ok || val == nil {
+		return nil
+	}
+	return &VarMatcher{s: val}
+}
+
 func (c *Config) HasVar(varName string) bool {
 	_, ok := c.Vars[varName]
 	return ok
@@ -109,6 +153,24 @@ func (c *Config) MatchVar(varName string, s any) bool {
 		return val.hasNumber(uint32(ret))
 	}
 	return false
+}
+
+// MatchAddr matches a pre-parsed netip.Addr against an address-group variable
+// without string parsing or big.Int allocation on IPv4 addresses.
+func (c *Config) MatchAddr(varName string, addr netip.Addr) bool {
+	if c == nil || c.Vars == nil || !addr.IsValid() {
+		return false
+	}
+	val, ok := c.Vars[varName]
+	if !ok {
+		return false
+	}
+	addr = addr.Unmap()
+	if addr.Is4() {
+		b := addr.As4()
+		return val.hasNumber(binary.BigEndian.Uint32(b[:]))
+	}
+	return val.hasNumberBigInt(new(big.Int).SetBytes(addr.AsSlice()))
 }
 
 func NewConfig() *Config {

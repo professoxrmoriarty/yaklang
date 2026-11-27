@@ -151,6 +151,12 @@ type ContentRuleConfig struct {
 	/* TLS */
 	TLSConfig *TLSRule
 
+	/* HTTP/2, SNMP, DCE/RPC, File */
+	HTTP2Config  *HTTP2Rule
+	SNMPConfig   *SNMPRule
+	DCERPCConfig *DCERPCRule
+	FileSize     *numrange.NumRange
+
 	/* Application-layer protocol/event predicates */
 	AppLayerProtocol        string
 	AppLayerProtocolNegated bool
@@ -249,6 +255,10 @@ type ContentRule struct {
 	// DotPrefix applies the Suricata dotprefix transform to the selected
 	// sticky buffer before this content match.
 	DotPrefix bool
+	// Transforms preserves ordered Suricata buffer transforms (such as
+	// dotprefix, to_lowercase, header_lowercase, url_decode, strip_whitespace,
+	// strip_pseudo_headers, to_sha1, to_sha256, to_md5) applied before matching.
+	Transforms []string
 	// no effect
 	RawBytes bool
 	IsDataAt string

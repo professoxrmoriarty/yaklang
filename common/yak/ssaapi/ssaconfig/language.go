@@ -14,12 +14,12 @@ func (l Language) String() string {
 
 const (
 	Yak     Language = "yak"
-	JS      Language = "js"
 	PHP     Language = "php"
 	JAVA    Language = "java"
 	GO      Language = "golang"
 	C       Language = "c"
-	TS      Language = "ts"
+	CPP     Language = "cpp"
+	TS      Language = "typescript"
 	PYTHON  Language = "python"
 	CSHARP  Language = "csharp"
 	BASH    Language = "bash"
@@ -40,10 +40,10 @@ func (l Language) GetFileExt() string {
 		return ".go"
 	case TS:
 		return ".ts"
-	case JS:
-		return ".js"
 	case C:
 		return ".c"
+	case CPP:
+		return ".cpp"
 	case PHP:
 		return ".php"
 	case PYTHON:
@@ -65,14 +65,31 @@ func (l Language) GetFileExt() string {
 	}
 }
 
+// CanonicalLanguage resolves every accepted spelling to the single language
+// value. It is the alias layer: javascript, js, ts and typescript all name the
+// TypeScript frontend, the same way go and golang name the golang value.
+func CanonicalLanguage(l Language) Language {
+	if normalized, err := ValidateLanguage(string(l)); err == nil {
+		return normalized
+	}
+	return l
+}
+
+// SameLanguage reports whether two language ids name the same language. Stored
+// rules may still carry legacy spellings such as js or javascript, so both
+// sides are canonicalized before they are compared.
+func SameLanguage(a, b Language) bool {
+	return CanonicalLanguage(a) == CanonicalLanguage(b)
+}
+
 func GetAllSupportedLanguages() []string {
 	return []string{
 		string(Yak),
-		string(JS),
 		string(PHP),
 		string(JAVA),
 		string(GO),
 		string(C),
+		string(CPP),
 		string(TS),
 		string(PYTHON),
 		string(CSHARP),
@@ -94,14 +111,14 @@ func ValidateLanguage(language string) (Language, error) {
 		return JAVA, nil
 	case "php":
 		return PHP, nil
-	case "js", "es", "javascript", "ecmascript", "nodejs", "node", "node.js":
-		return JS, nil
+	case "js", "es", "javascript", "ecmascript", "nodejs", "node", "node.js", "ts", "typescript":
+		return TS, nil
 	case "go", "golang":
 		return GO, nil
 	case "c", "clang":
 		return C, nil
-	case "ts", "typescript":
-		return TS, nil
+	case "cpp", "c++", "cplusplus", "cc", "cxx":
+		return CPP, nil
 	case "python", "py":
 		return PYTHON, nil
 	case "csharp", "c#", "cs", ".net", "dotnet":

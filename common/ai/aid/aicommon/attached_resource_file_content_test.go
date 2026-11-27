@@ -16,9 +16,13 @@ func TestAttachedFileContentIsLiteral(t *testing.T) {
 		resource, err := ParseAttachedResourceData(NewAttachedResource("file", "file_content", content))
 		require.NoError(t, err)
 		require.IsType(t, &AttachedFileContentResourceData{}, resource)
+		fileResource := resource.(*AttachedFileContentResourceData)
 		require.NoError(t, resource.BindLoopData(nil))
+		require.NotEmpty(t, fileResource.savedPath)
+		t.Cleanup(func() { _ = os.Remove(fileResource.savedPath) })
 		rendered := resource.ToAttachData(nil)
 		require.Contains(t, rendered, "--- File Content ---\n"+content+"\n--- End")
+		require.Contains(t, rendered, "Full content saved to file: "+fileResource.savedPath)
 		require.NotContains(t, rendered, "DO_NOT_READ_THIS")
 		require.NotContains(t, rendered, "failed to stat")
 	}
@@ -42,24 +46,5 @@ func TestAttachedFileContentReadBack(t *testing.T) {
 	require.Equal(t, content, string(full))
 	for i := 0; i < 3; i++ {
 		require.Equal(t, rendered, resource.ToAttachData(nil))
-	}
-}
-
-func TestFileContentProviderReusesReadBackFile(t *testing.T) {
-	content := strings.Repeat("large input\n", 10000) + "TAIL"
-	provider := NewContextProvider("file", "file_content", content)
-	first, err := provider(nil, nil, "test")
-	require.NoError(t, err)
-	_, after, found := strings.Cut(first, "Full content saved to file: ")
-	require.True(t, found)
-	path, _, _ := strings.Cut(after, "\n")
-	t.Cleanup(func() { _ = os.Remove(path) })
-	full, err := os.ReadFile(path)
-	require.NoError(t, err)
-	require.Equal(t, content, string(full))
-	for i := 0; i < 3; i++ {
-		next, err := provider(nil, nil, "test")
-		require.NoError(t, err)
-		require.Equal(t, first, next)
 	}
 }

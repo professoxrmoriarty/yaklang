@@ -23,6 +23,21 @@ type Config struct {
 	State               state.Config
 	OnAlert             func(Alert)
 	OnDiagnostic        func(Diagnostic)
+	// DisablePrefilter turns off minirehs/protocol prefiltering and evaluates
+	// every rule linearly. Primarily intended for differential equivalence
+	// verification and benchmarking.
+	DisablePrefilter bool
+}
+
+type PrefilterStats struct {
+	Enabled                bool
+	ActiveRules            int
+	CandidatesEvaluated    uint64
+	RulesSkipped           uint64
+	StreamFastFailHTTP     uint64
+	StreamFastFailTLS      uint64
+	DecompressedHTTPBodies uint64
+	Reloads                uint64
 }
 
 type Stats struct {
@@ -36,15 +51,23 @@ type Stats struct {
 	ActiveFlows  int
 	State        state.Stats
 	Capture      AdapterStats
+	Prefilter    PrefilterStats
+}
+
+type ruleSnapshot struct {
+	plans     []*CompiledRulePlan
+	prefilter *enginePrefilter
 }
 
 type StatefulEngine struct {
-	epoch          uint64
-	maxStreamBytes int
-	plans          []*CompiledRulePlan
-	store          *state.Store
-	onAlert        func(Alert)
-	onDiagnostic   func(Diagnostic)
+	epoch            uint64
+	maxStreamBytes   int
+	disablePrefilter bool
+	snapshotMu       sync.RWMutex
+	snapshot         *ruleSnapshot
+	store            *state.Store
+	onAlert          func(Alert)
+	onDiagnostic     func(Diagnostic)
 
 	flowsMu             sync.Mutex
 	flows               map[FlowKey]*flowRuntime
@@ -63,13 +86,48 @@ type StatefulEngine struct {
 	udpGeneration atomic.Uint64
 	udpTimeout    time.Duration
 
-	events       atomic.Uint64
-	packetEvents atomic.Uint64
-	streamEvents atomic.Uint64
-	transactions atomic.Uint64
-	alerts       atomic.Uint64
-	suppressed   atomic.Uint64
-	diagnostics  atomic.Uint64
+	events                 atomic.Uint64
+	packetEvents           atomic.Uint64
+	streamEvents           atomic.Uint64
+	transactions           atomic.Uint64
+	alerts                 atomic.Uint64
+	suppressed             atomic.Uint64
+	diagnostics            atomic.Uint64
+	candidatesEvaluated    atomic.Uint64
+	rulesSkipped           atomic.Uint64
+	streamFastFailHTTP     atomic.Uint64
+	streamFastFailTLS      atomic.Uint64
+	decompressedHTTPBodies atomic.Uint64
+	reloads                atomic.Uint64
+}
+
+func compileRuleSnapshot(rules []*rule.Rule, disablePrefilter bool) (*ruleSnapshot, error) {
+	identities := make(map[[2]int]struct{}, len(rules))
+	plans := make([]*CompiledRulePlan, 0, len(rules))
+	for index, current := range rules {
+		if current == nil || current.Sid <= 0 {
+			return nil, fmt.Errorf("stateful rule requires a positive sid")
+		}
+		identity := [2]int{current.Gid, current.Sid}
+		if _, exists := identities[identity]; exists {
+			return nil, fmt.Errorf("duplicate stateful rule identity gid=%d sid=%d", current.Gid, current.Sid)
+		}
+		identities[identity] = struct{}{}
+		plan, err := CompileStatefulRule(current)
+		if err != nil {
+			return nil, fmt.Errorf("compile stateful rule sid=%d: %w", current.Sid, err)
+		}
+		plan.Index = uint64(index + 1)
+		plans = append(plans, plan)
+	}
+	var pf *enginePrefilter
+	if !disablePrefilter && len(plans) > 0 {
+		pf = buildEnginePrefilter(plans)
+	}
+	return &ruleSnapshot{
+		plans:     plans,
+		prefilter: pf,
+	}, nil
 }
 
 func NewStatefulEngine(rules []*rule.Rule, config Config) (*StatefulEngine, error) {
@@ -96,11 +154,18 @@ func NewStatefulEngine(rules []*rule.Rule, config Config) (*StatefulEngine, erro
 	if err != nil {
 		return nil, err
 	}
+	snapshot, err := compileRuleSnapshot(rules, config.DisablePrefilter)
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
 	engine := &StatefulEngine{
 		epoch:               config.Epoch,
 		maxStreamBytes:      config.MaxStreamBytes,
 		maxTotalStreamBytes: config.MaxTotalStreamBytes,
 		maxFlows:            config.MaxFlows,
+		disablePrefilter:    config.DisablePrefilter,
+		snapshot:            snapshot,
 		store:               store,
 		onAlert:             config.OnAlert,
 		onDiagnostic:        config.OnDiagnostic,
@@ -112,27 +177,39 @@ func NewStatefulEngine(rules []*rule.Rule, config Config) (*StatefulEngine, erro
 	// Keep UDP pseudo-flow generations disjoint from pcaputil TCP generation
 	// numbers so the engine's FlowKey map cannot collide across transports.
 	engine.udpGeneration.Store(uint64(1) << 63)
-	identities := make(map[[2]int]struct{}, len(rules))
-	for index, current := range rules {
-		identity := [2]int{current.Gid, current.Sid}
-		if current.Sid <= 0 {
-			_ = store.Close()
-			return nil, fmt.Errorf("stateful rule requires a positive sid")
-		}
-		if _, exists := identities[identity]; exists {
-			_ = store.Close()
-			return nil, fmt.Errorf("duplicate stateful rule identity gid=%d sid=%d", current.Gid, current.Sid)
-		}
-		identities[identity] = struct{}{}
-		plan, err := CompileStatefulRule(current)
-		if err != nil {
-			_ = store.Close()
-			return nil, fmt.Errorf("compile stateful rule sid=%d: %w", current.Sid, err)
-		}
-		plan.Index = uint64(index + 1)
-		engine.plans = append(engine.plans, plan)
-	}
 	return engine, nil
+}
+
+// Reload compiles a replacement rule set and prefilter off the hot path, then
+// atomically swaps it into the running engine without dropping active flows or
+// flow state. If compilation fails, the active rule set remains unchanged.
+func (e *StatefulEngine) Reload(rules []*rule.Rule) error {
+	if e == nil || e.closed.Load() {
+		return fmt.Errorf("suricata engine is closed")
+	}
+	next, err := compileRuleSnapshot(rules, e.disablePrefilter)
+	if err != nil {
+		return err
+	}
+	e.snapshotMu.Lock()
+	if e.closed.Load() {
+		e.snapshotMu.Unlock()
+		if next.prefilter != nil {
+			next.prefilter.close()
+		}
+		return fmt.Errorf("suricata engine is closed")
+	}
+	prev := e.snapshot
+	e.snapshot = next
+	e.snapshotMu.Unlock()
+
+	// All readers that held snapshotMu.RLock() for prev have exited before
+	// Lock() was granted, so closing prev.prefilter here is race-free.
+	if prev != nil && prev.prefilter != nil {
+		prev.prefilter.close()
+	}
+	e.reloads.Add(1)
+	return nil
 }
 
 func (e *StatefulEngine) Handle(event InspectionEvent) Result {
@@ -145,6 +222,10 @@ func (e *StatefulEngine) Handle(event InspectionEvent) Result {
 		_, _ = e.store.Cleanup(eventTime(event))
 	}
 	switch event.View {
+	case ViewPhysicalPacket:
+		// No compiled rule targets raw physical frames directly; avoid
+		// scanning every rule plan on each captured packet.
+		return Result{}
 	case ViewFlowCreated:
 		e.flowsMu.Lock()
 		delete(e.tombstones, event.Flow.Key)
@@ -169,6 +250,20 @@ func (e *StatefulEngine) Handle(event InspectionEvent) Result {
 			e.diagnostic(&result, event, nil, "protocol-event", message)
 			return result
 		}
+		if event.Protocol.Protocol == "dcerpc" && event.Flow.Key.Generation != 0 {
+			if flow := e.flow(event.Flow.Key, true); flow != nil {
+				flow.mu.Lock()
+				if !flow.closed {
+					flow.observeProtocolEvent(event.Protocol)
+				}
+				flow.mu.Unlock()
+			}
+		}
+		// Complete decoded transactions do not currently match packet/stream
+		// rule plans unless explicitly enabled; fast-fail when prefilter is on.
+		if !e.disablePrefilter {
+			return Result{}
+		}
 	}
 	return e.inspect(event)
 }
@@ -176,6 +271,13 @@ func (e *StatefulEngine) Handle(event InspectionEvent) Result {
 func (e *StatefulEngine) Close() error {
 	if e == nil || !e.closed.CompareAndSwap(false, true) {
 		return nil
+	}
+	e.snapshotMu.Lock()
+	prev := e.snapshot
+	e.snapshot = &ruleSnapshot{}
+	e.snapshotMu.Unlock()
+	if prev != nil && prev.prefilter != nil {
+		prev.prefilter.close()
 	}
 	e.flowsMu.Lock()
 	e.flows = make(map[FlowKey]*flowRuntime)
@@ -189,6 +291,14 @@ func (e *StatefulEngine) Stats() Stats {
 	e.flowsMu.Lock()
 	active := len(e.flows)
 	e.flowsMu.Unlock()
+	e.snapshotMu.RLock()
+	activeRules := 0
+	prefilterEnabled := false
+	if e.snapshot != nil {
+		activeRules = len(e.snapshot.plans)
+		prefilterEnabled = e.snapshot.prefilter != nil
+	}
+	e.snapshotMu.RUnlock()
 	return Stats{
 		Events:       e.events.Load(),
 		PacketEvents: e.packetEvents.Load(),
@@ -200,6 +310,16 @@ func (e *StatefulEngine) Stats() Stats {
 		ActiveFlows:  active,
 		State:        stateStats,
 		Capture:      e.CaptureStats(),
+		Prefilter: PrefilterStats{
+			Enabled:                prefilterEnabled,
+			ActiveRules:            activeRules,
+			CandidatesEvaluated:    e.candidatesEvaluated.Load(),
+			RulesSkipped:           e.rulesSkipped.Load(),
+			StreamFastFailHTTP:     e.streamFastFailHTTP.Load(),
+			StreamFastFailTLS:      e.streamFastFailTLS.Load(),
+			DecompressedHTTPBodies: e.decompressedHTTPBodies.Load(),
+			Reloads:                e.reloads.Load(),
+		},
 	}
 }
 
@@ -329,75 +449,118 @@ func (e *StatefulEngine) inspect(event InspectionEvent) Result {
 
 	httpOffset := 0
 	var httpPayload []byte
+	var fullStreamPayload []byte
 	if event.View == ViewStream && flow != nil {
+		fullStreamPayload = flow.stream[event.Direction]
 		httpOffset = flow.httpNextOffset[event.Direction]
-		if httpOffset < len(flow.stream[event.Direction]) {
-			httpPayload = flow.stream[event.Direction][httpOffset:]
+		if httpOffset < len(fullStreamPayload) {
+			httpPayload = fullStreamPayload[httpOffset:]
 		}
 	}
 
-	for index, plan := range e.plans {
-		if !plan.acceptsView(event.View) {
-			continue
+	e.snapshotMu.RLock()
+	defer e.snapshotMu.RUnlock()
+	snap := e.snapshot
+	if snap == nil || len(snap.plans) == 0 {
+		return result
+	}
+	plans := snap.plans
+	prefilter := snap.prefilter
+
+	var sharedHTTP *match.HTTPBufferProvider
+	var sharedTLS *match.TLSBufferProvider
+	var headerMeta packetHeaderMeta
+
+	evalPlan := func(index int) {
+		plan := plans[index]
+		switch event.View {
+		case ViewNormalizedPacket:
+			if !plan.acceptsPacket {
+				return
+			}
+		case ViewStream:
+			if !plan.acceptsStream {
+				return
+			}
+		default:
+			if !plan.acceptsView(event.View) {
+				return
+			}
 		}
 		if flow != nil && !matchFlow(plan.Flow, flow, event.Direction) {
-			continue
+			return
+		}
+		if headerMeta.hasAddr && !matchRuleHeaderFast(plan.Rule, headerMeta) {
+			return
 		}
 		if len(plan.StreamSize) > 0 {
 			packetView := plan.Rule != nil && plan.Rule.Protocol == "tcp-pkt"
 			if !plan.matchStreamSize(flow, packetView) {
-				continue
+				return
 			}
 		}
-		streamKey := ruleDirection{ruleIndex: index, direction: event.Direction}
+		var streamKey ruleDirection
+		if plan.Rule != nil {
+			streamKey = ruleDirection{gid: plan.Rule.Gid, sid: plan.Rule.Sid, direction: event.Direction}
+		} else {
+			streamKey = ruleDirection{sid: -index - 1, direction: event.Direction}
+		}
 		var streamPayload []byte
 		cursor := 0
-		isHTTP := plan.Rule != nil && (plan.Rule.Protocol == "http" || rule.UsesHTTPBuffers(plan.Rule))
-		isTLS := plan.Rule != nil && (plan.Rule.Protocol == "tls" || rule.UsesTLSBuffers(plan.Rule))
+		isHTTP := plan.isHTTP
+		isTLS := plan.isTLS
 		if event.View == ViewStream && flow != nil && isTLS && flow.tlsMatched[streamKey] {
 			// TLS buffers are handshake-scoped. Once a rule matched a
 			// direction, later stream frames repeat the same certificate or
 			// SNI data and must not produce duplicate alerts or state effects.
-			continue
+			return
 		}
 		if event.View == ViewStream && flow != nil {
 			if isHTTP {
 				cursor = httpOffset
 				streamPayload = httpPayload
 				if len(streamPayload) == 0 {
-					continue
+					return
 				}
 			} else {
 				cursor = flow.streamCursor[streamKey]
-				streamPayload = flow.stream[event.Direction]
+				streamPayload = fullStreamPayload
 				flow.streamCursor[streamKey] = len(streamPayload)
 			}
 		}
-		matched, evidenceEnd, err := plan.match(event, flow, streamPayload)
+		var planHTTP *match.HTTPBufferProvider
+		if isHTTP {
+			planHTTP = sharedHTTP
+		}
+		var planTLS *match.TLSBufferProvider
+		if isTLS {
+			planTLS = sharedTLS
+		}
+		matched, evidenceEnd, err := plan.matchWithShared(event, flow, streamPayload, planHTTP, planTLS)
 		if err != nil {
 			e.diagnostic(&result, event, plan.Rule, "match-error", err.Error())
-			continue
+			return
 		}
 		if !matched {
-			continue
+			return
 		}
 		if event.View == ViewStream && !isHTTP && !isTLS && evidenceEnd <= cursor {
-			continue
+			return
 		}
 		stateResult, err := e.applyState(plan, event)
 		if err != nil {
 			e.diagnostic(&result, event, plan.Rule, "state-error", err.Error())
-			continue
+			return
 		}
 		if event.View == ViewStream && flow != nil && isTLS {
 			flow.tlsMatched[streamKey] = true
 		}
 		if !stateResult.qualified {
-			continue
+			return
 		}
 		if !stateResult.emit || plan.NoAlert {
 			e.suppressed.Add(1)
-			continue
+			return
 		}
 		alert := buildAlert(plan.Rule, event)
 		result.Alerts = append(result.Alerts, alert)
@@ -414,6 +577,39 @@ func (e *StatefulEngine) inspect(event InspectionEvent) Result {
 				tag.expiresAt = eventTime(event).Add(time.Duration(plan.Tag.Count) * time.Second)
 			}
 			flow.tags = append(flow.tags, tag)
+		}
+	}
+
+	if prefilter != nil && (event.View == ViewStream || event.View == ViewNormalizedPacket) {
+		collector := prefilter.acquireCollector()
+		if event.View == ViewStream {
+			var httpFastFailed, tlsFastFailed bool
+			sharedHTTP, sharedTLS, headerMeta, httpFastFailed, tlsFastFailed = prefilter.collectStreamCandidates(collector, event.Packet, flow, event.Direction, fullStreamPayload, httpPayload)
+			if httpFastFailed {
+				e.streamFastFailHTTP.Add(1)
+			}
+			if tlsFastFailed {
+				e.streamFastFailTLS.Add(1)
+			}
+		} else {
+			headerMeta = prefilter.collectPacketCandidates(collector, event.Packet)
+		}
+		candidates := collector.sorted()
+		e.candidatesEvaluated.Add(uint64(len(candidates)))
+		if len(plans) > len(candidates) {
+			e.rulesSkipped.Add(uint64(len(plans) - len(candidates)))
+		}
+		for _, index := range candidates {
+			evalPlan(index)
+		}
+		if sharedHTTP != nil && sharedHTTP.WasDecompressed() {
+			e.decompressedHTTPBodies.Add(1)
+		}
+		prefilter.releaseCollector(collector)
+	} else {
+		e.candidatesEvaluated.Add(uint64(len(plans)))
+		for index := range plans {
+			evalPlan(index)
 		}
 	}
 	// Advance the per-direction HTTP message cursor only after every HTTP rule

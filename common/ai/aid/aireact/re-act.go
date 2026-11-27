@@ -119,8 +119,10 @@ type ReAct struct {
 	browserSessionsMu sync.Mutex
 	browserSessionIDs map[string]struct{}
 
-	attachedBrowsersMu sync.Mutex
-	attachedBrowsers   []*aicommon.AttachedResource
+	browserAttachments browserAttachmentState
+
+	attachedFileMonitorsMu sync.Mutex
+	attachedFileMonitors   map[string]*attachedFileMonitor
 
 	miniAITaskRegistry *MiniAITaskRegistry
 }
@@ -253,6 +255,7 @@ func NewReAct(opts ...aicommon.ConfigOption) (*ReAct, error) {
 		wg:                   new(sync.WaitGroup),
 		lifecycleWG:          new(sync.WaitGroup),
 		browserSessionIDs:    make(map[string]struct{}),
+		attachedFileMonitors: make(map[string]*attachedFileMonitor),
 	}
 
 	// Initialize mini AI task registry and register built-in handlers
@@ -568,12 +571,7 @@ func (r *ReAct) SendInputEventAndWaitAccepted(event *ypb.AIInputEvent) (ret erro
 	// doing this synchronously, a directly-admitted free input could overtake a
 	// hot-patch still waiting in EventInputChan.
 	if event.GetIsConfigHotpatch() {
-		hotPatchOptions := r.config.ProcessHotPatchMessage(event)
-		r.config.PersistSessionStartParamsFromHotpatch(event)
-		for _, option := range hotPatchOptions {
-			r.config.HotPatchOptionChan.SafeFeed(option)
-		}
-		return nil
+		return r.config.DispatchHotPatch(event)
 	}
 
 	// Interactive and sync messages retain Config.processInputEvent's existing

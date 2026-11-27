@@ -7,6 +7,7 @@ import (
 
 	"github.com/yaklang/yaklang/common/utils"
 	cparser "github.com/yaklang/yaklang/common/yak/antlr4c/parser"
+	"github.com/yaklang/yaklang/common/yak/cfamily/cliteral"
 	"github.com/yaklang/yaklang/common/yak/ssa"
 	"github.com/yaklang/yaklang/common/yak/ssa/lifetime"
 )
@@ -1190,8 +1191,8 @@ func (b *astbuilder) buildCastExpression(ast *cparser.CastExpressionContext, isL
 	var left *ssa.Variable
 	if t := ast.TypeName(); t != nil {
 		ssatype := b.buildTypeName(t.(*cparser.TypeNameContext))
-		if c := ast.CastExpression(); c != nil {
-			right, left = b.buildCastExpression(c.(*cparser.CastExpressionContext), isLeft)
+		if c := ast.CastOperand(); c != nil {
+			right, left = b.buildCastOperand(c.(*cparser.CastOperandContext), isLeft)
 		}
 		if right != nil && !isLeft && ssatype != nil {
 			existingType := right.GetType()
@@ -1216,6 +1217,42 @@ func (b *astbuilder) buildCastExpression(ast *cparser.CastExpressionContext, isL
 	}
 
 	return right, left
+}
+
+// buildCastOperand handles `(type)-x`, `(type)~*p`, `(type)!x` and the plain
+// `(type)x` form. The unary variants need their own rule: the operand of a cast
+// whose type is a typedef or a struct/union tag is not an expression in the
+// grammar, so `(zval*)-1` and `(zend_uchar)~*p` failed to parse.
+func (b *astbuilder) buildCastOperand(ast *cparser.CastOperandContext, isLeft bool) (ssa.Value, *ssa.Variable) {
+	recoverRange := b.SetRange(&ast.BaseParserRuleContext)
+	defer recoverRange()
+
+	if c := ast.CastExpression(); c != nil {
+		return b.buildCastExpression(c.(*cparser.CastExpressionContext), isLeft)
+	}
+
+	var value ssa.Value
+	var left *ssa.Variable
+	if c := ast.CastOperand(); c != nil {
+		value, left = b.buildCastOperand(c.(*cparser.CastOperandContext), false)
+	}
+	if value == nil {
+		return nil, left
+	}
+	switch {
+	case ast.Minus() != nil:
+		return b.EmitUnOp(ssa.OpNeg, value), nil
+	case ast.Plus() != nil:
+		return b.EmitUnOp(ssa.OpPlus, value), nil
+	case ast.Tilde() != nil:
+		return b.EmitUnOp(ssa.OpBitwiseNot, value), nil
+	case ast.Not() != nil:
+		return b.EmitUnOp(ssa.OpNot, value), nil
+	case ast.Caret() != nil:
+		// Unary ^ is a GCC extension; keep the operand value.
+		return value, nil
+	}
+	return value, left
 }
 
 func (b *astbuilder) buildLeftExpression(ast *cparser.LeftExpressionContext, isLeft bool) (ssa.Value, *ssa.Variable) {
@@ -1577,65 +1614,26 @@ func (b *astbuilder) buildMacroArgument(ast *cparser.MacroArgumentContext) ssa.V
 	return b.EmitConstInst(0)
 }
 
+// Literal decoding is shared with the C++ frontend; see
+// common/yak/cfamily/cliteral. These wrappers keep the C call sites unchanged.
 func parseCChar(text string) int32 {
-	// 简单处理：去除前后引号，处理转义
-	if len(text) >= 2 && text[0] == '\'' && text[len(text)-1] == '\'' {
-		body := text[1 : len(text)-1]
-		if len(body) == 1 {
-			return int32(body[0])
-		}
-		if body[0] == '\\' {
-			// 处理转义字符
-			switch body[1] {
-			case 'n':
-				return '\n'
-			case 't':
-				return '\t'
-			case 'r':
-				return '\r'
-			case '\\':
-				return '\\'
-			case '\'':
-				return '\''
-				// 可扩展更多
-			}
-		}
-	}
-	return 0
+	return cliteral.ParseChar(text)
 }
 
 func isCIntLiteral(text string) bool {
-	// 简单判断：全为数字或0x/0X/0b/0B开头
-	if strings.HasPrefix(text, "0x") || strings.HasPrefix(text, "0X") || strings.HasPrefix(text, "0b") || strings.HasPrefix(text, "0B") {
-		return true
-	}
-	for i := 0; i < len(text); i++ {
-		if text[i] < '0' || text[i] > '9' {
-			return false
-		}
-	}
-	return true
+	return cliteral.IsInt(text)
 }
 
 func parseCInt(text string) (int64, error) {
-	if strings.HasPrefix(text, "0x") || strings.HasPrefix(text, "0X") {
-		return strconv.ParseInt(text[2:], 16, 64)
-	}
-	if strings.HasPrefix(text, "0b") || strings.HasPrefix(text, "0B") {
-		return strconv.ParseInt(text[2:], 2, 64)
-	}
-	if strings.HasPrefix(text, "0") && len(text) > 1 {
-		return strconv.ParseInt(text, 8, 64)
-	}
-	return strconv.ParseInt(text, 10, 64)
+	return cliteral.ParseInt(text)
 }
 
 func isCFloatLiteral(text string) bool {
-	return strings.Contains(text, ".") || strings.ContainsAny(text, "eE")
+	return cliteral.IsFloat(text)
 }
 
 func parseCFloat(text string) (float64, error) {
-	return strconv.ParseFloat(text, 64)
+	return cliteral.ParseFloat(text)
 }
 
 func coverType(ityp, iwantTyp ssa.Type) {

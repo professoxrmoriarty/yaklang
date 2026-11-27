@@ -363,6 +363,7 @@ func (m *MockInvoker) AssembleLoopPrompt(tools []*aitool.Tool, input *aicommon.L
 		Sections:          nil,
 		TimelineThroughID: &timeline.TimelineThroughID,
 		TimelineItemIDs:   timeline.TimelineItemIDs,
+		Images:            timeline.TimelineImages,
 	}, nil
 }
 
@@ -521,7 +522,11 @@ func (m *MockInvoker) ExecuteToolRequiredAndCallWithoutRequired(ctx context.Cont
 	return nil, false, nil
 }
 
-func (m *MockInvoker) DirectlyCallTool(ctx context.Context, toolName string, action *aicommon.Action, prepare aicommon.DirectlyCallPrepareFunc) (*aitool.ToolResult, bool, error) {
+func (m *MockInvoker) ReviewDirectToolCall(ctx context.Context, toolName string, action *aicommon.Action, prepare aicommon.DirectlyCallPrepareFunc, opt ...aicommon.ToolCallerOption) (*aicommon.ToolCallReviewResult, error) {
+	return nil, nil
+}
+
+func (m *MockInvoker) ExecuteReviewedToolCall(ctx context.Context, review *aicommon.ToolCallReviewResult) (*aitool.ToolResult, bool, error) {
 	return nil, false, nil
 }
 

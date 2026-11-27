@@ -126,7 +126,8 @@ const (
 	EVENT_TYPE_PONG EventType = "pong" // ping response ping-pong is a check for alive item
 
 	// 压力值
-	EVENT_TYPE_PRESSURE EventType = "pressure" // pressure for ai context percent
+	EVENT_TYPE_PRESSURE      EventType = "pressure"      // pressure for ai context percent
+	EVENT_TYPE_MODEL_CONTEXT EventType = "model_context" // main-model usage and compression threshold, in tokens
 
 	EVENT_TYPE_AI_FIRST_BYTE_COST_MS EventType = "ai_first_byte_cost_ms" // first byte cost
 	EVENT_TYPE_AI_TOTAL_COST_MS      EventType = "ai_total_cost_ms"      // total cost
@@ -182,6 +183,7 @@ const (
 	EVENT_TYPE_SUCCESS_REACT               EventType = "success_react_task"
 	EVENT_TYPE_END_PLAN_AND_EXECUTION      EventType = "end_plan_and_execution"
 	EVENT_TYPE_PLAN                        EventType = "plan"
+	EVENT_TYPE_SUB_FORGE_TASK_TREE         EventType = "sub_forge_task_tree"
 	EVENT_TYPE_PERMISSION_REQUIRE          EventType = "permission_require"
 	EVENT_TYPE_TASK_REVIEW_REQUIRE         EventType = "task_review_require"
 	EVENT_TYPE_PLAN_REVIEW_REQUIRE         EventType = "plan_review_require"

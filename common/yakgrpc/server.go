@@ -13,6 +13,7 @@ import (
 	"github.com/yaklang/yaklang/common/aibalanceclient"
 	"github.com/yaklang/yaklang/common/browser"
 	"github.com/yaklang/yaklang/common/imcontrol"
+	"github.com/yaklang/yaklang/common/pcapx/pcapdb"
 	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
 
 	"github.com/yaklang/yaklang/common/schema"
@@ -50,6 +51,9 @@ type Server struct {
 	browserBridge *browser.ExtensionBridgeManager
 	browserTasks  chan struct{}
 	runtimeForges *aiforge.RuntimeForgeRegistry
+
+	pcapManagerMu sync.Mutex
+	pcapManager   *pcapdb.InstanceManager // Owned when the server has an explicit profile.
 }
 
 type ServerOpts func(config *ServerConfig)
@@ -62,6 +66,7 @@ type ServerConfig struct {
 	projectDatabasePath string
 	browserBridge       bool
 	browserBridgePort   int
+	browserBridgeNative bool
 }
 
 func WithReverseServerPort(port int) ServerOpts {
@@ -98,6 +103,13 @@ func WithBrowserExtensionBridge(port int) ServerOpts {
 	return func(config *ServerConfig) {
 		config.browserBridge = true
 		config.browserBridgePort = port
+	}
+}
+
+func WithNativeBrowserExtensionBridge() ServerOpts {
+	return func(config *ServerConfig) {
+		config.browserBridge = true
+		config.browserBridgeNative = true
 	}
 }
 
@@ -241,7 +253,13 @@ func newServerEx(opts ...ServerOpts) (*Server, error) {
 		} else {
 			s.browserBridge = manager
 			browser.SetActiveExtensionBridgeManager(manager)
-			if startErr := manager.Start(serverConfig.browserBridgePort); startErr != nil {
+			var startErr error
+			if serverConfig.browserBridgeNative {
+				startErr = manager.StartNative()
+			} else {
+				startErr = manager.Start(serverConfig.browserBridgePort)
+			}
+			if startErr != nil {
 				log.Warnf("start browser extension bridge failed: %v", startErr)
 			} else {
 				log.Infof("browser extension bridge listening at %s", manager.Snapshot().URL)

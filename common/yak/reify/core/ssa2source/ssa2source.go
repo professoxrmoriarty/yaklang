@@ -14,20 +14,9 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/yaklang/yaklang/common/log"
 	"github.com/yaklang/yaklang/common/yak/ssa"
 )
-
-// unexpectedInstruction reports an instruction the conversion never produces. It
-// is raised from deep inside the structurer, which has no error return, and turned
-// into an error by Render.
-type unexpectedInstruction struct {
-	kind string
-	name string
-}
-
-func (e unexpectedInstruction) Error() string {
-	return fmt.Sprintf("ssa2source: unexpected %s %q: the LowIR conversion does not emit it", e.kind, e.name)
-}
 
 // Render converts a YakSSA program into source-like text.
 func Render(ctx context.Context, program *ssa.Program) (source string, err error) {
@@ -39,11 +28,9 @@ func Render(ctx context.Context, program *ssa.Program) (source string, err error
 		if recovered == nil {
 			return
 		}
-		if failure, ok := recovered.(unexpectedInstruction); ok {
-			source, err = "", failure
-			return
-		}
-		panic(recovered)
+		// Rendering is diagnostic output. A malformed program must produce an
+		// error the caller can print, not a crash of the whole process.
+		source, err = "", fmt.Errorf("ssa2source: render panic: %v", recovered)
 	}()
 	var output strings.Builder
 	var renderErr error
@@ -397,9 +384,12 @@ func pruneUnusedParameters(lines []string) []string {
 		return lines
 	}
 	header := lines[headerIndex]
-	open := strings.Index(header, "(")
 	closing := strings.LastIndex(header, ") {")
-	if open < 0 || closing < 0 || closing < open {
+	if closing < 0 {
+		return lines
+	}
+	open := matchingOpenParen(header, closing)
+	if open < 0 {
 		return lines
 	}
 	params := strings.Split(header[open+1:closing], ", ")
@@ -423,6 +413,26 @@ func pruneUnusedParameters(lines []string) []string {
 	}
 	lines[headerIndex] = header[:open+1] + strings.Join(kept, ", ") + header[closing:]
 	return lines
+}
+
+// matchingOpenParen returns the '(' that matches the ')' at close. A function
+// name may itself contain parentheses (a Go pointer-receiver method is
+// main.(*Box[int]).Get), so the parameter list is the last balanced group, not
+// the first '(' in the line.
+func matchingOpenParen(text string, close int) int {
+	depth := 0
+	for index := close; index >= 0; index-- {
+		switch text[index] {
+		case ')':
+			depth++
+		case '(':
+			depth--
+			if depth == 0 {
+				return index
+			}
+		}
+	}
+	return -1
 }
 
 func pruneDeadAssignments(function *ssa.Function, lines []string) []string {
@@ -513,11 +523,22 @@ func renderInstructionAt(text *strings.Builder, instruction ssa.Instruction, ind
 	case *ssa.ConstInst:
 		// Constants are rendered at their use sites.
 	case *ssa.BinOp:
+		if value.Op == ssa.OpStore {
+			fmt.Fprintf(text, "%s%s;\n", indent, storeExpression(value))
+			break
+		}
 		if !valueUsed(value) {
 			break
 		}
 		fmt.Fprintf(text, "%s%s = %s;\n", indent, assignName(value), binaryExpression(value))
 	case *ssa.UnOp:
+		if value.Op == ssa.OpLoad || value.Op == ssa.OpSpill {
+			// A memory read is an event at a fixed point in the instruction
+			// stream, so it keeps a line of its own. Inlining it at the use site
+			// would move the read past a later write.
+			fmt.Fprintf(text, "%s%s = %s;\n", indent, assignName(value), derefExpression(value))
+			break
+		}
 		if !valueUsed(value) {
 			break
 		}
@@ -532,12 +553,13 @@ func renderInstructionAt(text *strings.Builder, instruction ssa.Instruction, ind
 			fmt.Fprintf(text, "%s%s;\n", indent, expression)
 		}
 	case *ssa.TypeCast:
-		// Type casts are inlined at their use sites.
+		// A cast is inlined at its use sites, so it needs no statement of its own.
 	case *ssa.SideEffect:
 		// reify models no cross-procedure side effects, so the conversion has no
-		// path that emits one. A node here means an invariant broke; report it
-		// instead of rendering a statement no lifted instruction produced.
-		panic(unexpectedInstruction{kind: "side effect", name: value.GetName()})
+		// path that emits one. A node here means an invariant broke, so the node
+		// is reported and the rest of the function keeps rendering.
+		log.Errorf("ssa2source: unexpected side effect %q in %s", value.GetName(), functionOf(value))
+		fmt.Fprintf(text, "%s/* unexpected side effect: %s */\n", indent, sanitizeComment(value.GetName()))
 	case *ssa.Undefined:
 		if !valueUsed(value) {
 			break
@@ -698,9 +720,6 @@ func castConstantText(cast *ssa.TypeCast, constant *ssa.ConstInst) string {
 		return "nil"
 	}
 	if marker, ok := constant.GetRawValue().(string); ok {
-		if strings.HasPrefix(marker, "load:") {
-			return loadMarkerText(cast, marker)
-		}
 		if isBooleanType(cast.GetType()) {
 			return "false /* " + sanitizeComment(marker) + " */"
 		}
@@ -709,16 +728,23 @@ func castConstantText(cast *ssa.TypeCast, constant *ssa.ConstInst) string {
 	return constTextAs(constant, cast.GetType())
 }
 
-func loadMarkerText(cast *ssa.TypeCast, marker string) string {
-	addressID, err := strconv.ParseInt(strings.TrimPrefix(marker, "load:"), 10, 64)
-	if err != nil || cast == nil {
+// derefExpression renders a memory read as a C dereference of its address
+// operand. The load and spill instructions carry the address themselves, so the
+// expression names exactly the value the machine instruction read from.
+func derefExpression(read *ssa.UnOp) string {
+	if read == nil {
 		return "*(void *)(unknown)"
 	}
-	address, ok := cast.GetValueById(addressID)
-	if !ok || address == nil {
-		return "*(void *)(unknown)"
+	return fmt.Sprintf("*(%s *)(%s)", cTypeName(read.GetType()), valueNameByID(read, read.X))
+}
+
+// storeExpression renders a memory write. Its operands are the address and the
+// value written there, in that order.
+func storeExpression(store *ssa.BinOp) string {
+	if store == nil {
+		return "*(void *)(unknown) = unknown"
 	}
-	return fmt.Sprintf("*(%s *)(%s)", cTypeName(cast.GetType()), valueName(address))
+	return fmt.Sprintf("*(%s *)(%s) = %s", cTypeName(store.GetType()), valueNameByID(store, store.X), valueNameByID(store, store.Y))
 }
 
 func binaryExpression(value *ssa.BinOp) string {
@@ -882,7 +908,11 @@ func castExpression(cast *ssa.TypeCast) string {
 				sourceBits := typeBits(sourceValue.GetType())
 				innerBits := typeBits(inner.GetType())
 				outerBits := typeBits(cast.GetType())
-				if sourceBits > 0 && innerBits >= sourceBits && outerBits >= innerBits {
+				// Widening can only drop the intermediate cast when it preserves the
+				// source's signedness: (uint64_t)(int32_t)x sign-extends, while
+				// (uint64_t)x on a uint32_t does not.
+				if sourceBits > 0 && innerBits >= sourceBits && outerBits >= innerBits &&
+					sameIntegerSignedness(inner.GetType(), sourceValue.GetType()) {
 					return cCast(cast.GetType(), valueName(sourceValue))
 				}
 			}
@@ -896,6 +926,34 @@ func sameType(left, right ssa.Type) bool {
 		return false
 	}
 	return left.String() == right.String()
+}
+
+// sameIntegerSignedness reports whether two types carry the same sign. A
+// non-integer type counts as matching, so the caller keeps the previous
+// reduction for casts that do not convert an integer.
+func sameIntegerSignedness(left, right ssa.Type) bool {
+	leftSigned, leftOK := integerTypeSignedness(left)
+	rightSigned, rightOK := integerTypeSignedness(right)
+	if !leftOK || !rightOK {
+		return true
+	}
+	return leftSigned == rightSigned
+}
+
+func integerTypeSignedness(typ ssa.Type) (bool, bool) {
+	if typ == nil {
+		return false, false
+	}
+	name := typ.String()
+	switch {
+	case strings.HasPrefix(name, "int"):
+		return true, true
+	case strings.HasPrefix(name, "uint"):
+		return false, true
+	case len(name) > 1 && name[0] == 'i' && name[1] >= '0' && name[1] <= '9':
+		return false, true
+	}
+	return false, false
 }
 
 func typeBits(typ ssa.Type) int {
@@ -1263,4 +1321,17 @@ func invertValue(value ssa.Value) (string, bool) {
 		return invertValue(inner)
 	}
 	return "", false
+}
+
+// functionOf names the function an instruction belongs to, so a diagnostic can
+// point at the function that produced it.
+func functionOf(instruction ssa.Instruction) string {
+	function := instruction.GetFunc()
+	if function == nil {
+		return "<unknown>"
+	}
+	if name := function.GetVerboseName(); name != "" {
+		return name
+	}
+	return function.GetName()
 }

@@ -46,6 +46,43 @@ func (b *FunctionBuilder) Break() bool {
 	return false
 }
 
+// BreakLoop jumps to the break target of the depth-th enclosing loop.
+// Depth one is the innermost loop. Switch and label targets are skipped.
+func (b *FunctionBuilder) BreakLoop(depth int) bool {
+	return b.branchToLoop(depth, false)
+}
+
+// ContinueLoop jumps to the continue target of the depth-th enclosing loop.
+// Shells need depth here because `break N`/`continue N` count loops only,
+// while Break/Continue stop at the nearest target, which may be a switch.
+func (b *FunctionBuilder) ContinueLoop(depth int) bool {
+	return b.branchToLoop(depth, true)
+}
+
+func (b *FunctionBuilder) branchToLoop(depth int, continueLoop bool) bool {
+	if depth <= 0 {
+		return false
+	}
+	for t := b.target; t != nil; t = t.tail {
+		if t._continue == nil || t._break == nil {
+			continue
+		}
+		depth--
+		if depth != 0 {
+			continue
+		}
+		if continueLoop {
+			t.LabelTarget.Continue(b.CurrentBlock.ScopeTable)
+			b.EmitJump(t._continue)
+		} else {
+			t.LabelTarget.Break(b.CurrentBlock.ScopeTable)
+			b.EmitJump(t._break)
+		}
+		return true
+	}
+	return false
+}
+
 func (b *FunctionBuilder) BreakWithLabelName(labelName string) bool {
 	for target := b.target; target != nil; target = target.tail {
 		if target._break != nil && strings.Contains(target._break.name, labelName) {

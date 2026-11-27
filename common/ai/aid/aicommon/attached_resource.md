@@ -26,11 +26,11 @@ type AttachedResourceData interface {
     ToAttachData(loop ReActLoopIF) string
     Type() string
     BindLoopData(loop ReActLoopIF) error
-    Unmarshal(raw string) error
+    Unmarshal(resource *AttachedResource) error
 }
 ```
 
-- `Unmarshal(raw)`：把 `AttachedResource.Value` 转成资源结构字段。只做资源本身解析，不写 loop 状态。
+- `Unmarshal(resource)`：从完整 `AttachedResource` 中同时读取 `Type`、`Key`、`Value`，把传输资源转成结构化字段。只做资源本身解析，不写 loop 状态。
 - `Type()`：返回规范 type，作为 timeline 聚合 key 的来源。
 - `ToAttachData(loop)`：把结构化资源渲染成给模型看的 Markdown 文本。
 - `BindLoopData(loop)`：可选的通用绑定逻辑。只有资源本身天然需要写入通用 loop 状态时才使用。
@@ -54,6 +54,7 @@ type AttachedResourceData interface {
 - `default`：当 `Type` 没有命中任何注册 factory 时，解析为 `DefaultAttachedResourceData`。它保留原始 `Type/Key/Value`，并把 raw value 渲染为普通附加上下文。
 - `file`：`Type=file` 解析为 `AttachedFileResourceData`，并识别 `Kind`。`file_path`、`filepath`、`file-path` 只是兼容别名，也会解析为同一结构。
   - **语义：只读参考附加（`@mention` / 拖入文件）**，各 loop 通用；不应作为可覆写交付目标。
+  - 接收用户输入时，每个有效路径只向前端发一次 pin 事件：普通文件发 `filesystem_pin_filename`，目录发 `filesystem_pin_directory`。同一条消息内的重复路径合并；后续消息再次显式附加会重新通知。
   - `text`：`ToAttachData` 直接读取前 1024 字节作为内容预览。
   - `directory`：`ToAttachData` 调用 `filesys.Glance` 生成目录树，并裁剪到 1024 字节。
   - `image` / `binary`：`ToAttachData` 只输出文件元信息，不 dump 内容；通用入口会把 file resources 交给 loop 注册的 file handler 进一步解析。
@@ -91,8 +92,8 @@ func (d *AttachedExampleResourceData) Type() string {
     return AttachedResourceTypeExample
 }
 
-func (d *AttachedExampleResourceData) Unmarshal(raw string) error {
-    d.Raw = strings.TrimSpace(raw)
+func (d *AttachedExampleResourceData) Unmarshal(resource *AttachedResource) error {
+    d.Raw = strings.TrimSpace(resource.Value)
     if d.Raw == "" {
         return utils.Error("example resource is empty")
     }

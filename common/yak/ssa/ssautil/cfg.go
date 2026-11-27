@@ -352,6 +352,11 @@ func (s *SwitchStmt[T]) BuildBody(
 		s.mergeToNextBody = nil
 	}
 	retBody, retSvt := body(sub)
+	// Materialize the case end as a CoverBy shadow. The shadow keeps the
+	// variables visible from the condition scope, so both the fallthrough
+	// chain and the switch join can read this arm's assignments. Merging the
+	// live body scope instead loses the arm when it falls out of the switch
+	// without a break.
 	endSvt := s.condition.CreateSubScope()
 	endSvt.CoverBy(retSvt)
 	endBody := endSvt.CreateShadowScope()

@@ -241,6 +241,9 @@ func MergeCachedAISessionStartParams(cached, request *ypb.AIStartParams) *ypb.AI
 	merged := proto.Clone(cached).(*ypb.AIStartParams)
 	// Capabilities describe this connection, never the client that saved the session.
 	merged.ClientUI = request.GetClientUI()
+	if request.ImageInput != nil {
+		merged.ImageInput = proto.Clone(request.ImageInput).(*ypb.AIImageInputConfig)
+	}
 	merged.SingleModelMode = cached.GetSingleModelMode() || request.GetSingleModelMode()
 	if request.NetworkDebug != nil {
 		value := request.GetNetworkDebug()
@@ -267,6 +270,9 @@ func OverlayAISessionStartParams(base, patch *ypb.AIStartParams) *ypb.AIStartPar
 	}
 
 	next := proto.Clone(base).(*ypb.AIStartParams)
+	if patch.ImageInput != nil {
+		next.ImageInput = proto.Clone(patch.ImageInput).(*ypb.AIImageInputConfig)
+	}
 	if patch.NetworkDebug != nil {
 		value := patch.GetNetworkDebug()
 		next.NetworkDebug = &value
@@ -445,26 +451,9 @@ func overlayAIExecutionStrategy(base, patch *ypb.AIExecutionStrategy) *ypb.AIExe
 	if patch == nil {
 		return proto.Clone(base).(*ypb.AIExecutionStrategy)
 	}
-	next := proto.Clone(base).(*ypb.AIExecutionStrategy)
-	if patch.GetEnableMultiAgent() {
-		next.EnableMultiAgent = true
-	}
-	if patch.GetEnableGoalMode() {
-		next.EnableGoalMode = true
-	}
-	if patch.GetGoalMinIterations() > 0 {
-		next.GoalMinIterations = patch.GetGoalMinIterations()
-	}
-	if patch.GetMaxSubAgents() > 0 {
-		next.MaxSubAgents = patch.GetMaxSubAgents()
-	}
-	if patch.GetGoalDurationSeconds() != 0 {
-		next.GoalDurationSeconds = patch.GetGoalDurationSeconds()
-	}
-	if patch.GetGoalAcceptanceCriteria() != "" {
-		next.GoalAcceptanceCriteria = patch.GetGoalAcceptanceCriteria()
-	}
-	return next
+	// A present Strategy replaces the whole strategy, just like its hotpatch.
+	// Zero/false/empty fields clear the previous UI mode; only nil means retain.
+	return proto.Clone(patch).(*ypb.AIExecutionStrategy)
 }
 
 func GetAISessionMetaBySessionID(db *gorm.DB, sessionID string) (*schema.AISession, error) {

@@ -311,7 +311,15 @@ func (f *binFlow) detectDirection(dir int, wire []byte) {
 		return
 	}
 	if isHTTPStartLineCandidate(wire) {
-		return
+		// The generic detector only sees ProbeBytes. Re-run the dedicated HTTP
+		// start-line probe over the full bounded input so a valid long URL is not
+		// held forever merely because its CRLF falls outside the generic window.
+		if p := f.probeHTTPStartLine(wire); p.Verdict == ProbeAccept {
+			f.protocol = "http"
+			return
+		} else if p.Verdict == ProbeNeedMore {
+			return
+		}
 	}
 	if f.captureTCP && f.port(11300) && probeBeanstalk(w, f.a.config.ProbeBytes).Verdict == ProbeAccept {
 		f.protocol, f.beanstalk = "beanstalkd", &binBeanstalk{client: dir}
@@ -835,7 +843,14 @@ func (f *binFlow) consumeSession(dir int, e *ProtocolEvent, result map[string]an
 		e.Session, err = f.consumeRedis(dir, e)
 	case "websocket":
 		if e.Entry == "WebSocket" {
+			if f.ws.evidenceLimit == 0 {
+				f.ws.evidenceLimit = f.a.budget.MaxCollectionElements
+			}
+			f.ws.observeMessageSource(dir, e.Raw, e)
 			e.Session, err = f.ws.consume(dir, e.Raw)
+			if err == nil && websocketCompleteApplicationMessage(e.Session) {
+				e.applicationMessagePacketRefs = f.ws.takeMessageSource(dir)
+			}
 			if err == nil {
 				err = f.consumeOCPP(dir, e)
 			}

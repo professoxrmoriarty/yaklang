@@ -13,6 +13,10 @@ type AttachedFileResourceHandler func(r aicommon.AIInvokeRuntime, loop *ReActLoo
 
 var attachedFileResourceHandlers AttachedFileResourceHandler
 
+type attachedResourceUserPinNotice interface {
+	UserPinNotice() string
+}
+
 func RegisterAttachedFileResourceHandler(handler AttachedFileResourceHandler) {
 	if handler == nil {
 		return
@@ -32,32 +36,36 @@ func RunAttachedExtraResourcesInit(
 		return nil
 	}
 
-	sectionsByType := make(map[string][]string)
-	resourcesByType := make(map[string][]aicommon.AttachedResourceData)
-	var resources []aicommon.AttachedResourceData
-
-	for idx, data := range aicommon.NonEmptyAttachedResources(attachedDatas) {
+	nonEmptyResources := aicommon.NonEmptyAttachedResources(attachedDatas)
+	for idx := range nonEmptyResources {
 		loop.UserStatus(
 			fmt.Sprintf("正在加载第 %d 个附加资源", idx+1),
 			fmt.Sprintf("Loading attached resource %d", idx+1),
 		)
+	}
 
-		resource, err := aicommon.ParseAttachedResourceData(data)
-		if err != nil {
-			log.Warnf("attached extra resources: failed to parse type=%q value=%q: %v", strings.TrimSpace(data.Type), strings.TrimSpace(data.Value), err)
-			continue
-		}
-		resources = append(resources, resource)
+	resources, parseErrors := aicommon.ParseAttachedResourceDataList(nonEmptyResources)
+	for _, err := range parseErrors {
+		log.Warnf("attached extra resources: %v", err)
+	}
+	resourcesByType := make(map[string][]aicommon.AttachedResourceData)
+	for _, resource := range resources {
 		resourcesByType[resource.Type()] = append(resourcesByType[resource.Type()], resource)
-		if err := resource.BindLoopData(loop); err != nil {
-			log.Warnf("attached extra resources: failed to bind type=%q: %v", resource.Type(), err)
-			continue
+	}
+
+	sectionsByType := make(map[string][]string)
+	for typ, typedResources := range resourcesByType {
+		for _, resource := range typedResources {
+			if err := resource.BindLoopData(loop); err != nil {
+				log.Warnf("attached extra resources: failed to bind type=%q: %v", typ, err)
+				continue
+			}
+			recordAttachedResourceUserPin(r, resource)
+			rendered := strings.TrimSpace(resource.ToAttachData(loop))
+			if rendered != "" {
+				sectionsByType[typ] = append(sectionsByType[typ], rendered)
+			}
 		}
-		rendered := strings.TrimSpace(resource.ToAttachData(loop))
-		if rendered == "" {
-			continue
-		}
-		sectionsByType[resource.Type()] = append(sectionsByType[resource.Type()], rendered)
 	}
 
 	for typ, sections := range sectionsByType {
@@ -69,13 +77,36 @@ func RunAttachedExtraResourcesInit(
 			runAttachedFileResourceHandlers(r, loop, resourcesByType[typ])
 		}
 		r.AddToTimeline(timelineKey, strings.Join(sections, "\n\n---\n\n"))
-		r.AddToTimeline("import notice", fmt.Sprintf("%s has been recorded; use it when reasoning about the user's attached resources.", timelineKey))
 	}
 
-	if len(sectionsByType) > 0 {
+	if len(resources) > 0 {
 		loop.UserStatus("附加资源处理完成", "Finished loading attached resources")
 	}
 	return resources
+}
+
+// recordAttachedResourceUserPin keeps the fact that a user attached a file
+// outside ordinary compression while leaving the full rendering in Timeline.
+func recordAttachedResourceUserPin(r aicommon.AIInvokeRuntime, resource aicommon.AttachedResourceData) {
+	pinned, ok := resource.(attachedResourceUserPinNotice)
+	if !ok || r == nil || r.GetConfig() == nil {
+		return
+	}
+	notice := strings.TrimSpace(pinned.UserPinNotice())
+	if notice == "" {
+		return
+	}
+	provider, ok := r.GetConfig().(interface {
+		GetTimeline() *aicommon.Timeline
+	})
+	if !ok || provider.GetTimeline() == nil {
+		return
+	}
+	taskID := ""
+	if task := r.GetCurrentTask(); task != nil {
+		taskID = task.GetId()
+	}
+	provider.GetTimeline().EnsureTaskUserInput(taskID, notice, r.GetConfig().AcquireId)
 }
 
 func attachedResourceTimelineKey(typ string) string {

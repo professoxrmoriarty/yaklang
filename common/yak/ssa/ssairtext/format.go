@@ -11,7 +11,6 @@ import (
 
 var (
 	ssairAssignment = regexp.MustCompile(`^\t(?:<([^>]+)>\s+)?(t\d+)\s+=\s+(.*)$`)
-	ssairLoad       = regexp.MustCompile(`load:(\d+)`)
 )
 
 // Format renders a function with one type on every assigned value and an
@@ -57,7 +56,6 @@ func Format(function *ssa.Function) string {
 	width := 0
 	for _, line := range lines {
 		line = strings.ReplaceAll(replaceNames(line), "type-case", "type_cast")
-		line = ssairLoad.ReplaceAllString(line, "load(t$1)")
 		match := ssairAssignment.FindStringSubmatch(line)
 		if match == nil {
 			items = append(items, formatted{raw: line})
@@ -96,7 +94,9 @@ func Format(function *ssa.Function) string {
 }
 
 func renumberIDs(text string) string {
-	index := regexp.MustCompile(`t(\d+)|\((\d+)\)`)
+	// Match a value reference as a whole token. A type name such as int32 also
+	// contains t32, and a substring match would rewrite the type.
+	index := regexp.MustCompile(`\bt(\d+)\b|\((\d+)\)`)
 	next := int64(1)
 	ids := make(map[int64]int64)
 	return index.ReplaceAllStringFunc(text, func(match string) string {
